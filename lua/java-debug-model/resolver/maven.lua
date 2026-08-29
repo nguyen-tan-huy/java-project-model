@@ -296,10 +296,15 @@ function M.build(root, opts, callback)
       end
 
       -- Independent poms found by filesystem scan but not part of the
-      -- aggregator's effective-pom output need their own resolve.
+      -- aggregator's effective-pom output need their own resolve. `root`
+      -- itself is NEVER a candidate here: it's the aggregator (packaging
+      -- pom, already fully represented by the modules resolved above), and
+      -- re-running `mvn help:effective-pom` directly inside it would just
+      -- re-emit the SAME multi-block reactor output, not a single clean
+      -- block describing root as a leaf.
       local independent_dirs = {}
       for _, dir in ipairs(all_pom_dirs) do
-        if not reactor_by_path[dir] then
+        if dir ~= root and not reactor_by_path[dir] then
           table.insert(independent_dirs, dir)
         end
       end
@@ -326,8 +331,25 @@ function M.build(root, opts, callback)
           function(ok2, stdout2)
             if ok2 then
               local sub_parsed = M._parse_effective_pom(stdout2)
-              if sub_parsed[1] and sub_parsed[1].packaging ~= "pom" then
-                reactor_by_path[dir] = sub_parsed[1]
+              -- Running mvn directly inside `dir` normally yields exactly one
+              -- clean block for `dir` itself. But if `dir` turns out to be a
+              -- nested aggregator too (its own <modules>), it re-emits
+              -- multiple blocks the same way root does - pick the one whose
+              -- artifactId matches dir's own directory name rather than
+              -- blindly trusting block order.
+              local own_name = vim.fn.fnamemodify(dir, ":t")
+              local own_block = nil
+              for _, p in ipairs(sub_parsed) do
+                if p.packaging ~= "pom" and p.artifact_id == own_name then
+                  own_block = p
+                  break
+                end
+              end
+              if not own_block and #sub_parsed == 1 and sub_parsed[1].packaging ~= "pom" then
+                own_block = sub_parsed[1]
+              end
+              if own_block then
+                reactor_by_path[dir] = own_block
               end
             end
             pending = pending - 1

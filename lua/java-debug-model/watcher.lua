@@ -25,7 +25,22 @@ end
 ---@param root string
 ---@param opts table
 local function rebuild(root, opts, callback)
+  -- mvn can easily take 10-60s on a real multi-module project (several
+  -- effective-pom + dependency:build-classpath calls). Without an explicit
+  -- "in progress" notification this reads as Neovim being frozen, since
+  -- nothing else prints while it's running.
+  local notify_timer = vim.loop.new_timer()
+  local notified = false
+  notify_timer:start(1500, 0, vim.schedule_wrap(function()
+    notify_timer:close()
+    notified = true
+    vim.notify("java-debug-model: resolving Maven project (this can take a while on first run)...",
+      vim.log.levels.INFO)
+  end))
+
   maven.build(root, opts, function(ok, project, err)
+    if not notify_timer:is_closing() then notify_timer:stop(); notify_timer:close() end
+
     if not ok then
       vim.notify("java-debug-model: Maven resolve failed: " .. tostring(err), vim.log.levels.ERROR)
       if callback then callback(false, nil) end
@@ -40,6 +55,10 @@ local function rebuild(root, opts, callback)
     M._rewatch(root)
     for _, cb in ipairs(state.on_reload) do
       pcall(cb, project)
+    end
+    if notified then
+      vim.notify("java-debug-model: Maven project resolved (" .. #project.modules .. " modules)",
+        vim.log.levels.INFO)
     end
     if callback then callback(true, project) end
   end)

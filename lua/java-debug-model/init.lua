@@ -147,13 +147,39 @@ function M.reload(root)
   end)
 end
 
+-- `print(vim.inspect(project))` on a real multi-module project can dump
+-- thousands of lines (every classpath jar, every source root...) into
+-- Neovim's message history, which triggers the blocking "-- More --" pager
+-- and looks exactly like a frozen editor. A scratch buffer/split has no such
+-- limit and stays interactive (search, fold, etc.).
+local inspect_bufnr = nil
+
 function M.inspect(root)
   local project = projects_by_root[root]
   if not project then
-    vim.notify("java-debug-model: no model resolved yet for " .. root, vim.log.levels.WARN)
+    vim.notify("java-debug-model: no model resolved yet for " .. root .. " (try :JavaModelReload first)",
+      vim.log.levels.WARN)
     return
   end
-  print(vim.inspect(project))
+  if not inspect_bufnr or not vim.api.nvim_buf_is_valid(inspect_bufnr) then
+    inspect_bufnr = vim.api.nvim_create_buf(false, true)
+    vim.bo[inspect_bufnr].buftype = "nofile"
+    vim.bo[inspect_bufnr].bufhidden = "hide"
+    vim.bo[inspect_bufnr].filetype = "lua"
+    vim.api.nvim_buf_set_name(inspect_bufnr, "java-debug-model://inspect")
+  end
+  local lines = vim.split(vim.inspect(project), "\n")
+  vim.bo[inspect_bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(inspect_bufnr, 0, -1, false, lines)
+  vim.bo[inspect_bufnr].modifiable = false
+
+  local winid = vim.fn.bufwinid(inspect_bufnr)
+  if winid ~= -1 then
+    vim.api.nvim_set_current_win(winid)
+  else
+    vim.cmd("botright split")
+    vim.api.nvim_win_set_buf(0, inspect_bufnr)
+  end
 end
 
 ---Registers a module manually (independent pom outside the scanned tree, or
