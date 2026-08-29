@@ -1,0 +1,37 @@
+*java-debug-model.txt*   IntelliJ Project Model + Debug + Maven for Neovim
+
+==============================================================================
+CONTENTS                                            *java-debug-model-contents*
+
+    1. Introduction .......... |java-debug-model-introduction|
+    2. Setup .................. |java-debug-model-setup|
+    3. Commands ............... |java-debug-model-commands|
+
+==============================================================================
+1. Introduction                                *java-debug-model-introduction*
+
+java-debug-model recreates IntelliJ's Project Model, Run/Debug
+Configurations, Maven Lifecycle tool window, and JUnit test runner for
+Java/Maven projects, backed by real `mvn` output rather than a hand-rolled
+pom.xml parser. See README.md for the full feature list and architecture.
+
+==============================================================================
+2. Setup                                              *java-debug-model-setup*
+
+>lua
+    require("java-debug-model").setup({
+      auto_attach = false,
+      active_profiles = {},
+      jdtls_bundle_globs = {},
+      jdtls_config = {},
+      open_j9_java_exec = nil,
+    })
+<
+
+==============================================================================
+3. Commands                                        *java-debug-model-commands*
+
+See README.md's Commands section for the full list of `:Java*`, `:Test*` and
+`:JavaMaven*` user commands.
+
+ vim:tw=78:ts=8:noet:ft=help:norl:

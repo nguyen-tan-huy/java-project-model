@@ -1,0 +1,28 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>test-parent</artifactId>
+    <version>1.0.0</version>
+    <relativePath>../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>module-a</artifactId>
+  <packaging>jar</packaging>
+
+  <dependencies>
+    <!-- Sibling reference to the independent module-b pom, resolved purely
+         by groupId:artifactId coordinate matching, not reactor <modules>. -->
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>module-b</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
