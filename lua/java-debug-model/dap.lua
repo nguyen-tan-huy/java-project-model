@@ -44,6 +44,17 @@ function M.build_launch_config(project, config, opts)
   local classpaths = jdtls_bridge.resolve_classpath(project, module, { include_test = false })
   local sourcepaths = jdtls_bridge.resolve_sourcepaths(project, module, { include_test = false })
 
+  -- `env` must serialize as a JSON OBJECT (java-debug/Gson deserializes it as
+  -- Map<String,String>) - but vim.json.encode has no way to tell an empty
+  -- Lua table was meant as a map rather than a list, and always emits `[]`
+  -- for it. A config with no env vars set at all (the common case) would
+  -- then fail at launch with a JSON deserialization error on the server
+  -- side. vim.empty_dict() is the documented escape hatch: it forces `{}`.
+  local env = snapshot.env_vars
+  if not env or next(env) == nil then
+    env = vim.empty_dict()
+  end
+
   local dap_config = {
     type = "java",
     request = "launch",
@@ -55,7 +66,7 @@ function M.build_launch_config(project, config, opts)
     sourcePaths = sourcepaths,
     vmArgs = snapshot.vm_args,
     args = snapshot.program_args,
-    env = snapshot.env_vars,
+    env = env,
     cwd = snapshot.working_directory,
   }
 
