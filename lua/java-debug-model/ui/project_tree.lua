@@ -19,6 +19,8 @@ local state = {
   tree = nil,
   -- line number -> TreeNode, rebuilt on every render
   line_map = {},
+  tree_winid = nil,    -- the tree's own window - files must NEVER open here
+  target_winid = nil,  -- the window files open into, like neo-tree/nvim-tree
 }
 
 local function scandir_children(dir, depth)
@@ -157,10 +159,39 @@ local function node_at_cursor()
   return state.line_map[lnum]
 end
 
+---Finds (or creates) the window files should open into: a fixed "target"
+---window, remembered across calls - not Vim's transient "previous window"
+---(`wincmd p`), which drifts as soon as the user moves focus around and can
+---end up pointing back at the tree's own window, silently replacing it.
+---@return integer winid
+local function get_or_create_target_win()
+  if state.target_winid and vim.api.nvim_win_is_valid(state.target_winid)
+    and state.target_winid ~= state.tree_winid then
+    return state.target_winid
+  end
+
+  -- Fall back to any other non-floating window that isn't the tree itself.
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if win ~= state.tree_winid and vim.api.nvim_win_get_config(win).relative == "" then
+      state.target_winid = win
+      return win
+    end
+  end
+
+  -- No other window exists (tree is the only one open): split one off.
+  if state.tree_winid and vim.api.nvim_win_is_valid(state.tree_winid) then
+    vim.api.nvim_set_current_win(state.tree_winid)
+  end
+  vim.cmd("vsplit")
+  state.target_winid = vim.api.nvim_get_current_win()
+  return state.target_winid
+end
+
 local function open_file_at_cursor()
   local node = node_at_cursor()
   if node and node.kind == "file" and node.path then
-    vim.cmd("wincmd p")
+    local winid = get_or_create_target_win()
+    vim.api.nvim_set_current_win(winid)
     vim.cmd("edit " .. vim.fn.fnameescape(node.path))
   elseif node then
     toggle_at_cursor()
@@ -186,10 +217,22 @@ function M.open(root, project)
 
   local winid = vim.fn.bufwinid(state.bufnr)
   if winid ~= -1 then
+    state.tree_winid = winid
     vim.api.nvim_set_current_win(winid)
   else
+    -- Remember whatever window was active before opening the tree as the
+    -- "target" files should open into - this is what makes <CR> reliably
+    -- reuse that same editing window instead of Vim's transient "previous
+    -- window" (`wincmd p`), which drifts as focus moves around and can end
+    -- up pointing back at the tree itself.
+    local previous_win = vim.api.nvim_get_current_win()
+    if previous_win ~= state.tree_winid and vim.api.nvim_win_get_config(previous_win).relative == "" then
+      state.target_winid = previous_win
+    end
+
     vim.cmd("topleft 40vsplit")
     vim.api.nvim_win_set_buf(0, state.bufnr)
+    state.tree_winid = vim.api.nvim_get_current_win()
   end
   render()
 end
