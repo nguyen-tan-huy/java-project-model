@@ -53,33 +53,53 @@ function M.open(root, project, opts)
     }, cb)
   end
 
+  -- vim.ui.input distinguishes "cancelled" (Esc/Ctrl-C) from "confirmed
+  -- empty string" by passing nil vs "" to its callback (see :h vim.ui.input,
+  -- and the `_canceled`/cancelreturn handling in the default implementation).
+  -- Every step below must therefore treat nil as "abort the whole edit",
+  -- never as "leave this field blank" - otherwise cancelling partway
+  -- through (a natural instinct when you don't want to change THIS
+  -- particular field, e.g. to leave env vars untouched) silently falls
+  -- through as an empty value instead, which for env_vars means wiping
+  -- every previously-saved variable with no warning at all.
+  local function cancelled()
+    vim.notify("java-debug-model: debug config edit cancelled, nothing was changed", vim.log.levels.INFO)
+  end
+
   pick_module(function(module)
     if not module then return end
 
     vim.ui.input({ prompt = "Config name: ", default = existing and existing.name or "" }, function(name)
-      if not name or name == "" then return end
+      if name == nil then cancelled() return end
+      if name == "" then return end
 
       vim.ui.input({
         prompt = "Main class: ",
         default = existing and existing.main_class or (opts.default_main_class or ""),
       }, function(main_class)
-        if not main_class or main_class == "" then return end
+        if main_class == nil then cancelled() return end
+        if main_class == "" then return end
 
         vim.ui.input({ prompt = "VM args: ", default = existing and existing.vm_args or "" }, function(vm_args)
+          if vm_args == nil then cancelled() return end
           vim.ui.input({ prompt = "Program args: ", default = existing and existing.program_args or "" },
             function(program_args)
+              if program_args == nil then cancelled() return end
               vim.ui.input({
                 prompt = "Env vars (KEY=val,KEY2=val2): ",
                 default = existing and format_env_vars(existing.env_vars) or "",
               }, function(env_str)
+                if env_str == nil then cancelled() return end
                 vim.ui.input({
                   prompt = "Working directory: ",
                   default = existing and existing.working_directory or module.content_root,
                 }, function(cwd)
+                  if cwd == nil then cancelled() return end
                   vim.ui.input({
                     prompt = "Maven profiles (comma-separated): ",
                     default = existing and table.concat(existing.maven_profiles, ",") or "",
                   }, function(profiles_str)
+                    if profiles_str == nil then cancelled() return end
                     local config = {
                       name = name,
                       module_path = module.path,
