@@ -24,40 +24,63 @@ M.opts = {
   jdtls_bundle_globs = {},
 }
 
--- The root most recently resolved from a real file buffer. Falling back to
--- vim.fn.getcwd() when the current buffer isn't inside any project is wrong
--- the moment the user runs a :Java* command while one of this plugin's own
--- scratch panels (project tree, Maven panel, test results...) happens to be
--- the focused window - those buffers are unnamed/nofile, so find_root(0)
--- would silently resolve to wherever Neovim was launched from instead of the
--- project the user is actually working in. Remembering the last real root
--- and falling back to THAT instead keeps every :Java* command consistent
--- regardless of which window currently has focus.
+-- The root most recently resolved (from a real file buffer, or from cwd at
+-- startup/:cd - see resolve_root_from_cwd below). Falling back to
+-- vim.fn.getcwd() UNCONDITIONALLY when the current buffer isn't inside any
+-- project is wrong the moment the user runs a :Java* command while one of
+-- this plugin's own scratch panels (project tree, Maven panel, test
+-- results...) happens to be the focused window - those buffers are
+-- unnamed/nofile, so find_root(0) would silently resolve to wherever Neovim
+-- was launched from instead of the project the user is actually working in.
+-- Remembering the last real root and falling back to THAT instead keeps
+-- every :Java* command consistent regardless of which window has focus.
 local last_root = nil
 
+---Walks upward from `start_dir` for the outermost ancestor that still has a
+---pom.xml (the reactor root), or nil if `start_dir` isn't inside a Maven
+---project at all.
+---@param start_dir string
+---@return string|nil
+local function walk_up_for_reactor_root(start_dir)
+  local found = vim.fs.find("pom.xml", { path = start_dir, upward = true })[1]
+  if not found then return nil end
+  local dir = vim.fn.fnamemodify(found, ":h")
+  while true do
+    local parent = vim.fn.fnamemodify(dir, ":h")
+    if vim.fn.filereadable(parent .. "/pom.xml") == 1 then
+      dir = parent
+    else
+      break
+    end
+  end
+  return dir
+end
+
+---Resolves a root from Neovim's current working directory alone, with no
+---buffer involved - so root is known the moment you `cd`/launch nvim into a
+---Maven project, before ever opening a .java file. Safe to call repeatedly
+---(e.g. on VimEnter and DirChanged): it's just directory-walking, no `mvn`.
+local function resolve_root_from_cwd()
+  local dir = walk_up_for_reactor_root(vim.fn.getcwd())
+  if dir then
+    last_root = dir
+  end
+  return dir
+end
+
 ---@return string root - the workspace root for the current buffer, found by
----walking up for a pom.xml, falling back to the last resolved root (or cwd
----if none yet) when the current buffer isn't a real file inside a project.
+---walking up for a pom.xml, falling back to the last resolved root (which
+---may already be set from cwd - see resolve_root_from_cwd) when the current
+---buffer isn't a real file inside a project.
 local function find_root(bufnr)
   local bufname = vim.api.nvim_buf_get_name(bufnr or 0)
   local is_own_panel = bufname:match("^java%-debug%-model://") ~= nil
   if bufname == "" or is_own_panel then
-    return last_root or vim.fn.getcwd()
+    return last_root or resolve_root_from_cwd() or vim.fn.getcwd()
   end
 
-  local start = vim.fn.fnamemodify(bufname, ":h")
-  local found = vim.fs.find("pom.xml", { path = start, upward = true })[1]
-  if found then
-    -- walk further up while a parent pom.xml exists (find the reactor root)
-    local dir = vim.fn.fnamemodify(found, ":h")
-    while true do
-      local parent = vim.fn.fnamemodify(dir, ":h")
-      if vim.fn.filereadable(parent .. "/pom.xml") == 1 then
-        dir = parent
-      else
-        break
-      end
-    end
+  local dir = walk_up_for_reactor_root(vim.fn.fnamemodify(bufname, ":h"))
+  if dir then
     last_root = dir
     return dir
   end
@@ -342,6 +365,15 @@ end
 function M.setup(opts)
   M.opts = vim.tbl_deep_extend("force", M.opts, opts or {})
   session.setup_listeners()
+
+  -- Resolve root from cwd immediately - this is cheap directory-walking
+  -- only (no `mvn`), so it's fine to run unconditionally even outside a
+  -- Maven project. Means :Java* commands know the right project the moment
+  -- Neovim opens in it, without requiring a .java buffer first.
+  resolve_root_from_cwd()
+  vim.api.nvim_create_autocmd("DirChanged", {
+    callback = function() resolve_root_from_cwd() end,
+  })
 
   if M.opts.auto_attach then
     vim.api.nvim_create_autocmd("FileType", {
