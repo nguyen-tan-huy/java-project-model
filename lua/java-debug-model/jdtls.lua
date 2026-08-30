@@ -34,9 +34,14 @@ end
 ---Resolves the full compile/runtime classpath for `module`.
 ---
 ---Source of truth is module._classpath_jars alone - Maven's own,
----already-mediated classpath for THIS module (resolved with
-----DincludeScope=runtime by resolver/maven.lua), which already accounts
----for every sibling module's own transitive dependencies correctly,
+---already-mediated, scope-unfiltered classpath for THIS module (resolver/
+---maven.lua deliberately doesn't pass -DincludeScope: no single Maven scope
+---threshold expresses "compile+runtime+provided, not test", and a real
+---project's `provided`-scope dependencies - e.g. spring-boot-starter-tomcat
+---for a WAR deployment - are commonly REQUIRED to actually run locally
+---under a debugger, exactly like IntelliJ's own Run Configurations include
+---them). Test-scope direct dependencies are filtered out below instead.
+---This already accounts for every sibling module's own transitive dependencies correctly,
 ---exactly the way a real `mvn install` + normal run would: when
 ---computing-manager depends on sibling computing-connector, Maven resolves
 ---computing-connector as a regular dependency and pulls its OWN
@@ -72,13 +77,31 @@ function M.resolve_classpath(project, module, opts)
     table.insert(paths, module.path .. "/target/test-classes")
   end
 
+  -- module._classpath_jars is unfiltered by scope (see doc comment above),
+  -- so test-scope must be excluded here instead. Only DIRECTLY-declared
+  -- test dependencies have a known scope in the model - a test-scope-only
+  -- transitive dependency (never its own <dependency> entry) can't be
+  -- identified this way and stays on the classpath, which is a far safer
+  -- default than the alternative (a scope filter that also silently drops
+  -- required `provided` dependencies, as -DincludeScope=runtime did).
+  local test_scope_artifact_ids = {}
+  if not opts.include_test then
+    for _, dep in ipairs(module.dependencies) do
+      if dep.scope == "test" and not dep.is_sibling then
+        test_scope_artifact_ids[dep.artifact_id] = true
+      end
+    end
+  end
+
   for _, jar in ipairs(module._classpath_jars or {}) do
     local artifact = jar:match("([^/\\]+)/[^/\\]+/[^/\\]+%.jar$")
-    local sibling_module = artifact and project:find_module_by_artifact_id(artifact)
-    if sibling_module and sibling_module.path ~= module.path then
-      table.insert(paths, sibling_module.path .. "/target/classes")
-    else
-      table.insert(paths, jar)
+    if not (artifact and test_scope_artifact_ids[artifact]) then
+      local sibling_module = artifact and project:find_module_by_artifact_id(artifact)
+      if sibling_module and sibling_module.path ~= module.path then
+        table.insert(paths, sibling_module.path .. "/target/classes")
+      else
+        table.insert(paths, jar)
+      end
     end
   end
 

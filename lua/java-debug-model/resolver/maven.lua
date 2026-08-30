@@ -554,18 +554,26 @@ end
 ---the kind of spawn storm that can make a whole machine (not just Neovim)
 ---sluggish on a real project with many modules.
 ---
-----DincludeScope=runtime (Maven's own scope filter, NOT the sibling-named
-----Dmdep.* form, which is silently ignored) resolves exactly compile+runtime
----scope dependencies, transitives included - this is what a normal launch
----classpath needs. Letting Maven do this filtering itself, rather than us
----guessing scope from a flat jar list afterward, is what makes
----jdtls.resolve_classpath's exclusion of test-scope jars correct even for
----transitive-only dependencies that never appear as their own <dependency>
----entry in the module's effective pom.
+---Deliberately NOT scope-filtered (no -DincludeScope). Maven's own scope
+---thresholds can't express "compile+runtime+provided, but not test" in one
+---flag: `includeScope=runtime` gives compile+runtime only (excludes
+---provided), `includeScope=compile` gives compile+provided+system (excludes
+---runtime-scope-only deps). A real project commonly needs `provided`
+---dependencies to actually RUN locally under a debugger even though they're
+---excluded from the packaged/deployed artifact - e.g. spring-boot-starter-
+---tomcat (and therefore javax.servlet.Filter) declared `<scope>provided</scope>`
+---for a project that deploys as a WAR to an external Tomcat in production.
+---IntelliJ's own Run/Debug Configurations include `provided` scope for
+---exactly this reason; excluding it (as an earlier version of this function
+---did, to solve test-scope leaking into the launch classpath) breaks any
+---such project outright with a NoClassDefFoundError/ClassNotFoundException
+---for whatever the provided dependency supplies. Test-scope exclusion is
+---instead handled by jdtls.resolve_classpath, filtering out jars matched to
+---a directly-declared test-scope dependency.
 function M._resolve_classpaths(project, _all_pom_dirs, opts, done)
   run_limited(project.modules, MAX_CONCURRENT_MVN, function(mod, item_done)
     local outfile = vim.fn.tempname()
-    M._run_maven(mod.path, { "dependency:build-classpath", "-DincludeScope=runtime", "-Dmdep.outputFile=" .. outfile },
+    M._run_maven(mod.path, { "dependency:build-classpath", "-Dmdep.outputFile=" .. outfile },
       { profiles = opts.active_profiles, offline = opts.offline },
       function(ok)
         if ok and vim.fn.filereadable(outfile) == 1 then
