@@ -6,26 +6,6 @@ local session = require("java-debug-model.session")
 
 local M = {}
 
----Requests a FRESH debug session/port from the java-debug bundle. Never
----cache/reuse a previously obtained port: vscode.java.startDebugSession
----returns a new one on every call, which is exactly what lets multiple
----concurrent debug sessions run independently.
----@param callback fun(ok: boolean, port: integer|nil)
-function M.request_fresh_port(callback)
-  local client = vim.lsp.get_clients({ name = "jdtls" })[1]
-  if not client then
-    callback(false, nil)
-    return
-  end
-  client:request("workspace/executeCommand", { command = "vscode.java.startDebugSession" }, function(err, port)
-    if err or not port then
-      callback(false, nil)
-      return
-    end
-    callback(true, port)
-  end, 0)
-end
-
 ---Builds one nvim-dap `dap.configurations.java` entry from a saved
 ---DebugConfig, snapshotting the config at launch time (editing/removing the
 ---saved config afterwards must not affect an already-running session).
@@ -82,9 +62,17 @@ function M.build_launch_config(project, config, opts)
   return dap_config
 end
 
----Launches a snapshot-built dap config through nvim-dap, always requesting a
----fresh session/port first, and registers it with session.lua's registry so
----concurrent sessions (different modules/profile combos) don't collide.
+---Launches a snapshot-built dap config through nvim-dap, and registers it
+---with session.lua's registry so concurrent sessions (different
+---modules/profile combos) don't collide.
+---
+---Note on "fresh port per launch": nvim-jdtls's own `dap.adapters.java`
+---(start_debug_adapter in jdtls/dap.lua) already calls
+---`vscode.java.startDebugSession` itself, fresh, every single time dap.run()
+---resolves the "java" adapter - it's a function-type adapter, never cached
+---by nvim-dap. Any port WE set on the config here would be silently ignored
+---anyway (dap.attach() reads it off the resolved adapter, not the config),
+---so this module doesn't fetch or set one at all.
 ---@param project table
 ---@param config table DebugConfig
 ---@param opts table?
@@ -92,34 +80,49 @@ function M.launch(project, config, opts)
   opts = opts or {}
   local dap_config = M.build_launch_config(project, config, opts)
 
-  M.request_fresh_port(function(ok, port)
-    if not ok then
-      vim.notify("java-debug-model: failed to obtain a fresh debug session/port", vim.log.levels.ERROR)
-      return
+  local ok_dap, dap = pcall(require, "dap")
+  if not ok_dap then
+    vim.notify("java-debug-model: nvim-dap not found", vim.log.levels.ERROR)
+    return
+  end
+
+  local session_id = session.register({
+    name = dap_config.name,
+    module_path = config.module_path,
+    profiles = config.maven_profiles,
+  })
+
+  -- nvim-dap's dap.run(config, opts) only supports opts.before/opts.new -
+  -- there is no "after" hook, dap.run() doesn't return the Session it
+  -- creates (session creation happens asynchronously, after the adapter
+  -- function's own startDebugSession round-trip resolves), and Session
+  -- objects don't store their launch config anywhere - so there's no direct
+  -- way to correlate a freshly-created Session back to this specific
+  -- launch. What dap.run() DOES do synchronously, the moment the Session
+  -- object is constructed (well before its DAP handshake completes), is
+  -- call dap.set_session() - so polling dap.session() for a NEW object
+  -- (different from whatever was focused right before this call) is the
+  -- reliable signal available.
+  local session_before = dap.session()
+  local attempts = 0
+  local function poll_for_new_session()
+    attempts = attempts + 1
+    local current = dap.session()
+    if current and current ~= session_before then
+      session.mark_started(session_id, current)
+    elseif attempts < 150 then -- ~30s at 200ms - covers a slow JVM cold start
+      vim.defer_fn(poll_for_new_session, 200)
+    else
+      vim.notify(
+        "java-debug-model: timed out waiting for debug session '" .. dap_config.name .. "' to start",
+        vim.log.levels.WARN)
     end
-    dap_config.port = port
-    dap_config.hostName = "127.0.0.1"
+  end
+  vim.defer_fn(poll_for_new_session, 100)
 
-    local ok_dap, dap = pcall(require, "dap")
-    if not ok_dap then
-      vim.notify("java-debug-model: nvim-dap not found", vim.log.levels.ERROR)
-      return
-    end
-
-    local session_id = session.register({
-      name = dap_config.name,
-      module_path = config.module_path,
-      profiles = config.maven_profiles,
-      port = port,
-    })
-
-    dap.run(dap_config, {
-      before = function(conf) return conf end,
-      after = function()
-        session.mark_started(session_id, dap.session())
-      end,
-    })
-  end)
+  dap.run(dap_config, {
+    before = function(conf) return conf end,
+  })
 end
 
 return M

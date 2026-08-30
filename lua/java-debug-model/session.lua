@@ -9,7 +9,6 @@ local M = {}
 ---@field name string
 ---@field module_path string
 ---@field profiles string[]
----@field port integer
 ---@field status "starting"|"running"|"stopped"
 ---@field dap_session table|nil   -- the nvim-dap Session object, once started
 
@@ -17,7 +16,7 @@ local M = {}
 local sessions = {}
 local next_id = 1
 
----@param fields table { name, module_path, profiles, port }
+---@param fields table { name, module_path, profiles }
 ---@return integer id
 function M.register(fields)
   local id = next_id
@@ -27,7 +26,6 @@ function M.register(fields)
     name = fields.name,
     module_path = fields.module_path,
     profiles = fields.profiles or {},
-    port = fields.port,
     status = "starting",
     dap_session = nil,
   })
@@ -117,6 +115,52 @@ function M.setup_listeners()
         M.mark_stopped(entry.id)
       end
     end
+  end
+
+  -- nvim-dap never terminates a running session's debuggee on its own when
+  -- Neovim exits - a session is a JDWP/socket connection to a target JVM
+  -- that jdtls spawned, not a child process of Neovim, so it isn't touched
+  -- by quitting the editor. Without this, closing Neovim leaves the
+  -- launched application (e.g. a Spring Boot app under debug) running in
+  -- the background indefinitely.
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    callback = function() M.terminate_all_sync() end,
+  })
+end
+
+---Disconnects every tracked running session with terminateDebuggee=true,
+---blocking (via vim.wait) until they've all actually closed or
+---`timeout_ms` elapses - called on VimLeavePre so the target JVM(s) don't
+---outlive Neovim. Safe to call with nothing running (no-op).
+---@param timeout_ms integer?
+function M.terminate_all_sync(timeout_ms)
+  timeout_ms = timeout_ms or 3000
+  local running = M.list_running()
+  local pending = 0
+  for _, entry in ipairs(running) do
+    if entry.dap_session then
+      pending = pending + 1
+      -- Also mark the entry stopped here directly, rather than relying
+      -- solely on nvim-dap's own terminated/exited DAP EVENT to do it:
+      -- that event fires independently of (and with no ordering guarantee
+      -- against) this disconnect REQUEST's response, so waiting only on
+      -- `pending` above could leave the registry saying "running" for a
+      -- session whose JVM is already dead.
+      local ok, err = pcall(entry.dap_session.disconnect, entry.dap_session, { terminateDebuggee = true }, function()
+        M.mark_stopped(entry.id)
+        pending = pending - 1
+      end)
+      if not ok then
+        vim.schedule(function()
+          vim.notify("java-debug-model: session.disconnect failed: " .. tostring(err), vim.log.levels.WARN)
+        end)
+        M.mark_stopped(entry.id)
+        pending = pending - 1
+      end
+    end
+  end
+  if pending > 0 then
+    vim.wait(timeout_ms, function() return pending <= 0 end, 50)
   end
 end
 

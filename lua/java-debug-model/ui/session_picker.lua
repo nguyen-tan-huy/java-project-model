@@ -6,7 +6,7 @@ local M = {}
 
 local function format_entry(entry)
   local profile_str = #entry.profiles > 0 and (" [" .. table.concat(entry.profiles, ",") .. "]") or ""
-  return string.format("%s%s - %s (port %d)", entry.name, profile_str, entry.status, entry.port)
+  return string.format("%s%s - %s", entry.name, profile_str, entry.status)
 end
 
 ---Opens a vim.ui.select picker over every tracked session (running or
