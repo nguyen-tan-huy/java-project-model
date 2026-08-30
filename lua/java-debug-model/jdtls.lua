@@ -31,66 +31,59 @@ function M.collect_bundles(glob_patterns)
   return bundles
 end
 
----Resolves the full compile/runtime classpath for `module`, recursively:
----sibling-module dependencies resolve to that sibling's live output
----directory (target/classes) instead of a possibly-stale .m2 jar, so
----cross-module debug reflects live source edits with no manual `mvn
----install`, as long as the sibling is loaded in the same jdtls workspace.
+---Resolves the full compile/runtime classpath for `module`.
+---
+---Source of truth is module._classpath_jars alone - Maven's own,
+---already-mediated classpath for THIS module (resolved with
+----DincludeScope=runtime by resolver/maven.lua), which already accounts
+---for every sibling module's own transitive dependencies correctly,
+---exactly the way a real `mvn install` + normal run would: when
+---computing-manager depends on sibling computing-connector, Maven resolves
+---computing-connector as a regular dependency and pulls its OWN
+---transitive graph in already, mediated against computing-manager's own
+---constraints into ONE single version per artifact.
+---
+---What must NOT happen is separately resolving each sibling's own
+---classpath in isolation and unioning the results together: two sibling
+---modules can each independently (and each correctly, in isolation)
+---mediate a shared transitive library to a DIFFERENT version - merging
+---both raw results back in then puts two conflicting versions of the same
+---library on one classpath at once (observed for real: computing-manager
+---mediates cashbook-core to 1.0.0, its sibling computing-connector
+---mediates the same artifact to 3.5.4 - unioning both, as an earlier
+---version of this function did, put both jars on the classpath together,
+---causing Spring's component scan to find two same-named-but-different
+---beans and fail with ConflictingBeanDefinitionException). Substituting
+---jar-for-jar within module's own single resolved list avoids this
+---entirely, and still gets cross-module debug for free: any jar in that
+---list that happens to BE one of this project's own modules (found by
+---artifactId, at whatever transitive depth) is swapped for that module's
+---live output directory instead of the possibly-stale .m2 jar - no manual
+---`mvn install` needed as long as that module is loaded in the same jdtls
+---workspace.
 ---@param project table Project
 ---@param module table Module
----@param opts table?  { include_test?: boolean, _seen?: table }
+---@param opts table?  { include_test?: boolean }
 ---@return string[] absolute paths (jars and/or output dirs)
 function M.resolve_classpath(project, module, opts)
   opts = opts or {}
-  local seen = opts._seen or {}
-  if seen[module.path] then return {} end
-  seen[module.path] = true
-
-  local paths = {}
-  table.insert(paths, module.path .. "/target/classes")
+  local paths = { module.path .. "/target/classes" }
   if opts.include_test then
     table.insert(paths, module.path .. "/target/test-classes")
   end
 
-  -- Sibling modules resolve to their LIVE output (never a jar, even if
-  -- Maven also resolved a .m2 one for the same coordinates) - recurse so
-  -- a sibling's own transitive classpath (including further siblings)
-  -- comes along too, and remember its artifactId to exclude the matching
-  -- .m2 jar below.
-  local exclude_artifact_ids = {}
-  for _, dep in ipairs(module.dependencies) do
-    if dep.is_sibling and dep.sibling_module_path then
-      local sibling = project:find_module_by_path(dep.sibling_module_path)
-      if sibling then
-        exclude_artifact_ids[sibling.artifact_id] = true
-        vim.list_extend(paths, M.resolve_classpath(project, sibling, { include_test = false, _seen = seen }))
-      end
-    end
-  end
-
-  -- Everything else comes from Maven's OWN fully-resolved classpath
-  -- (module._classpath_jars, resolved with -DincludeScope=runtime by
-  -- resolver/maven.lua's _resolve_classpaths - i.e. already test-scope-free,
-  -- transitives included), never reconstructed from this module's own
-  -- directly-declared <dependency> entries. A transitive dependency (pulled
-  -- in by another dependency, not declared directly here) would never
-  -- appear in module.dependencies - reconstructing from it silently drops
-  -- such jars from the launch classpath, which is exactly what produces a
-  -- NoClassDefFoundError at runtime for a class that's genuinely on the
-  -- real Maven classpath. (opts.include_test has no extra jars to add here
-  -- since it's currently only used to add target/test-classes above - no
-  -- caller resolves a test-inclusive external classpath today.)
   for _, jar in ipairs(module._classpath_jars or {}) do
     local artifact = jar:match("([^/\\]+)/[^/\\]+/[^/\\]+%.jar$")
-    if not (artifact and exclude_artifact_ids[artifact]) then
+    local sibling_module = artifact and project:find_module_by_artifact_id(artifact)
+    if sibling_module and sibling_module.path ~= module.path then
+      table.insert(paths, sibling_module.path .. "/target/classes")
+    else
       table.insert(paths, jar)
     end
   end
 
-  -- A dependency shared between this module and a sibling (or between
-  -- multiple siblings) legitimately shows up in more than one of the
-  -- _classpath_jars lists merged above - dedupe rather than hand the
-  -- debug adapter a classpath with repeated entries.
+  -- Two different sibling substitutions (or a jar Maven's own resolution
+  -- happened to list twice) can still coincide - dedupe defensively.
   local deduped, seen_path = {}, {}
   for _, p in ipairs(paths) do
     if not seen_path[p] then
@@ -101,19 +94,20 @@ function M.resolve_classpath(project, module, opts)
   return deduped
 end
 
----Resolves source roots the same way: sibling modules contribute their real
----source directories so stepping into a dependency module's code during
----debug resolves to its actual file, not a decompiled jar.
+---Resolves source roots the same way resolve_classpath does: any jar on
+---module's own flat classpath that turns out to be one of this project's
+---own modules (by artifactId) contributes that module's real main source
+---directory, so stepping into a dependency module's code during debug
+---resolves to its actual file, not a decompiled jar. Scanning the flat,
+---already-transitively-complete classpath (rather than recursing through
+---module.dependencies) means a sibling that's only a TRANSITIVE dependency
+---(never declared directly on `module`) still gets its source path added.
 ---@param project table Project
 ---@param module table Module
----@param opts table?  { include_test?: boolean, _seen?: table }
+---@param opts table?  { include_test?: boolean }
 ---@return string[]
 function M.resolve_sourcepaths(project, module, opts)
   opts = opts or {}
-  local seen = opts._seen or {}
-  if seen[module.path] then return {} end
-  seen[module.path] = true
-
   local paths = {}
   for _, sr in ipairs(module.source_roots) do
     if sr.kind == "main" or opts.include_test then
@@ -121,11 +115,14 @@ function M.resolve_sourcepaths(project, module, opts)
     end
   end
 
-  for _, dep in ipairs(module.dependencies) do
-    if dep.is_sibling and dep.sibling_module_path then
-      local sibling = project:find_module_by_path(dep.sibling_module_path)
-      if sibling then
-        vim.list_extend(paths, M.resolve_sourcepaths(project, sibling, { include_test = false, _seen = seen }))
+  local seen_module = { [module.path] = true }
+  for _, jar in ipairs(module._classpath_jars or {}) do
+    local artifact = jar:match("([^/\\]+)/[^/\\]+/[^/\\]+%.jar$")
+    local sibling_module = artifact and project:find_module_by_artifact_id(artifact)
+    if sibling_module and not seen_module[sibling_module.path] then
+      seen_module[sibling_module.path] = true
+      for _, sr in ipairs(sibling_module:main_source_roots()) do
+        table.insert(paths, sr.path)
       end
     end
   end

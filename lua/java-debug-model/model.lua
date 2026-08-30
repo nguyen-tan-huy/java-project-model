@@ -101,6 +101,17 @@ function Project:find_module_by_path(path)
   return nil
 end
 
+---Finds a module purely by artifactId - used to recognize a jar on a
+---resolved classpath (which only ever carries the artifact filename, never
+---groupId) as actually being one of this project's own modules.
+---@param artifact_id string
+function Project:find_module_by_artifact_id(artifact_id)
+  for _, mod in ipairs(self.modules) do
+    if mod.artifact_id == artifact_id then return mod end
+  end
+  return nil
+end
+
 ---Finds which module owns a given absolute file path, by longest source-root
 ---(then content-root) prefix match.
 ---@param file_path string
