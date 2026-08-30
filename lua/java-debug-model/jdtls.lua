@@ -52,20 +52,53 @@ function M.resolve_classpath(project, module, opts)
     table.insert(paths, module.path .. "/target/test-classes")
   end
 
+  -- Sibling modules resolve to their LIVE output (never a jar, even if
+  -- Maven also resolved a .m2 one for the same coordinates) - recurse so
+  -- a sibling's own transitive classpath (including further siblings)
+  -- comes along too, and remember its artifactId to exclude the matching
+  -- .m2 jar below.
+  local exclude_artifact_ids = {}
   for _, dep in ipairs(module.dependencies) do
-    if dep.scope ~= "test" or opts.include_test then
-      if dep.is_sibling and dep.sibling_module_path then
-        local sibling = project:find_module_by_path(dep.sibling_module_path)
-        if sibling then
-          vim.list_extend(paths, M.resolve_classpath(project, sibling, { include_test = false, _seen = seen }))
-        end
-      elseif dep.library and dep.library.jar_path then
-        table.insert(paths, dep.library.jar_path)
+    if dep.is_sibling and dep.sibling_module_path then
+      local sibling = project:find_module_by_path(dep.sibling_module_path)
+      if sibling then
+        exclude_artifact_ids[sibling.artifact_id] = true
+        vim.list_extend(paths, M.resolve_classpath(project, sibling, { include_test = false, _seen = seen }))
       end
     end
   end
 
-  return paths
+  -- Everything else comes from Maven's OWN fully-resolved classpath
+  -- (module._classpath_jars, resolved with -DincludeScope=runtime by
+  -- resolver/maven.lua's _resolve_classpaths - i.e. already test-scope-free,
+  -- transitives included), never reconstructed from this module's own
+  -- directly-declared <dependency> entries. A transitive dependency (pulled
+  -- in by another dependency, not declared directly here) would never
+  -- appear in module.dependencies - reconstructing from it silently drops
+  -- such jars from the launch classpath, which is exactly what produces a
+  -- NoClassDefFoundError at runtime for a class that's genuinely on the
+  -- real Maven classpath. (opts.include_test has no extra jars to add here
+  -- since it's currently only used to add target/test-classes above - no
+  -- caller resolves a test-inclusive external classpath today.)
+  for _, jar in ipairs(module._classpath_jars or {}) do
+    local artifact = jar:match("([^/\\]+)/[^/\\]+/[^/\\]+%.jar$")
+    if not (artifact and exclude_artifact_ids[artifact]) then
+      table.insert(paths, jar)
+    end
+  end
+
+  -- A dependency shared between this module and a sibling (or between
+  -- multiple siblings) legitimately shows up in more than one of the
+  -- _classpath_jars lists merged above - dedupe rather than hand the
+  -- debug adapter a classpath with repeated entries.
+  local deduped, seen_path = {}, {}
+  for _, p in ipairs(paths) do
+    if not seen_path[p] then
+      seen_path[p] = true
+      table.insert(deduped, p)
+    end
+  end
+  return deduped
 end
 
 ---Resolves source roots the same way: sibling modules contribute their real

@@ -26,6 +26,29 @@ for _, p in ipairs(classpath) do
   assert(not p:find("module%-b.*%.m2"), "should never resolve sibling module-b via .m2 jar path")
 end
 
+-- Transitive-dependency regression check: module-b depends directly on
+-- jackson-databind, which pulls in jackson-core/jackson-annotations
+-- TRANSITIVELY - neither is declared in module-a's or module-b's own
+-- <dependencies>. A classpath built by walking declared <dependency>
+-- entries would silently drop these (the exact NoClassDefFoundError bug).
+local found_jackson_databind, found_jackson_core, found_jackson_annotations = false, false, false
+for _, p in ipairs(classpath) do
+  if p:find("jackson%-databind") then found_jackson_databind = true end
+  if p:find("jackson%-core") then found_jackson_core = true end
+  if p:find("jackson%-annotations") then found_jackson_annotations = true end
+end
+assert(found_jackson_databind, "module-a's classpath should include module-b's direct dep jackson-databind")
+assert(found_jackson_core, "module-a's classpath should include jackson-core (TRANSITIVE via jackson-databind)")
+assert(found_jackson_annotations,
+  "module-a's classpath should include jackson-annotations (TRANSITIVE via jackson-databind)")
+
+-- test-scope filtering check: junit-jupiter (module-a's own direct TEST
+-- dependency) and its transitives must NOT leak into the main launch
+-- classpath.
+for _, p in ipairs(classpath) do
+  assert(not p:find("junit"), "junit (test-scope) must not appear in the main launch classpath: " .. p)
+end
+
 local sourcepaths = jdtls.resolve_sourcepaths(project, mod_a)
 print("module-a sourcepaths:")
 for _, p in ipairs(sourcepaths) do print("  " .. p) end

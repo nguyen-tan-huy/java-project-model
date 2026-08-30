@@ -14,6 +14,16 @@
   </properties>
 
   <dependencies>
+    <!-- Deliberately pulls in jackson-core + jackson-annotations
+         TRANSITIVELY (neither is declared here nor anywhere in module-a) -
+         this is what regresses to a NoClassDefFoundError at runtime if the
+         launch classpath is reconstructed from directly-declared
+         <dependency> entries instead of Maven's own resolved classpath. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.17.0</version>
+    </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>

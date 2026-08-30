@@ -553,10 +553,19 @@ end
 ---MAX_CONCURRENT_MVN at a time - one JVM per module, unbounded, is exactly
 ---the kind of spawn storm that can make a whole machine (not just Neovim)
 ---sluggish on a real project with many modules.
+---
+----DincludeScope=runtime (Maven's own scope filter, NOT the sibling-named
+----Dmdep.* form, which is silently ignored) resolves exactly compile+runtime
+---scope dependencies, transitives included - this is what a normal launch
+---classpath needs. Letting Maven do this filtering itself, rather than us
+---guessing scope from a flat jar list afterward, is what makes
+---jdtls.resolve_classpath's exclusion of test-scope jars correct even for
+---transitive-only dependencies that never appear as their own <dependency>
+---entry in the module's effective pom.
 function M._resolve_classpaths(project, _all_pom_dirs, opts, done)
   run_limited(project.modules, MAX_CONCURRENT_MVN, function(mod, item_done)
     local outfile = vim.fn.tempname()
-    M._run_maven(mod.path, { "dependency:build-classpath", "-Dmdep.outputFile=" .. outfile },
+    M._run_maven(mod.path, { "dependency:build-classpath", "-DincludeScope=runtime", "-Dmdep.outputFile=" .. outfile },
       { profiles = opts.active_profiles, offline = opts.offline },
       function(ok)
         if ok and vim.fn.filereadable(outfile) == 1 then
