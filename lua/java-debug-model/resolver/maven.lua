@@ -312,128 +312,200 @@ function M._scan_for_poms(dir, callback)
   maybe_finish()
 end
 
+local function disk_cache_path(root)
+  return root .. "/.nvim/java-debug-model/model-cache.json"
+end
+
+---@return table<string, {mtimes: table<string,integer>, modules: table[]}>
+local function load_disk_cache(root)
+  local path = disk_cache_path(root)
+  if vim.fn.filereadable(path) == 0 then return {} end
+  local ok, decoded = pcall(vim.json.decode, table.concat(vim.fn.readfile(path), "\n"))
+  if not ok or type(decoded) ~= "table" then return {} end
+  return decoded
+end
+
+local function save_disk_cache(root, key, entry)
+  local path = disk_cache_path(root)
+  local all = load_disk_cache(root)
+  all[key] = entry
+  vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+  local ok, encoded = pcall(vim.json.encode, all)
+  if ok then
+    vim.fn.writefile(vim.split(encoded, "\n"), path)
+  end
+end
+
+local function pom_mtimes(dirs)
+  local mtimes = {}
+  for _, dir in ipairs(dirs) do
+    local stat = vim.loop.fs_stat(dir .. "/pom.xml")
+    mtimes[dir .. "/pom.xml"] = stat and stat.mtime.sec or -1
+  end
+  return mtimes
+end
+
+local function mtimes_equal(a, b)
+  local count_a, count_b = 0, 0
+  for k in pairs(a) do count_a = count_a + 1 end
+  for k in pairs(b) do count_b = count_b + 1 end
+  if count_a ~= count_b then return false end
+  for k, v in pairs(a) do
+    if b[k] ~= v then return false end
+  end
+  return true
+end
+
+---Reconstructs a Project from a disk-cached module list (plain decoded JSON
+---tables), giving each Module its real methods back via Module.new().
+---@param root string
+---@param modules_data table[]
+---@return table Project
+local function project_from_cached_modules(root, modules_data)
+  local project = model.Project.new(root)
+  for _, m in ipairs(modules_data) do
+    local mod = model.Module.new(m)
+    mod._classpath_jars = m._classpath_jars
+    project:add_module(mod)
+  end
+  return project
+end
+
 ---Builds a Project for the module tree rooted at `root`, combining
 ---aggregator <modules> discovery with a filesystem scan (for independent,
 ---non-reactor poms), merged and deduped by resolved absolute path.
+---
+---Resolved projects are cached both in memory (for the rest of this Neovim
+---session) AND to `<root>/.nvim/java-debug-model/model-cache.json`, keyed by
+---every discovered pom.xml's mtime - a fresh `nvim` on an unchanged project
+---loads straight from disk instead of re-running `mvn` from scratch.
 ---@param root string
----@param opts table   { active_profiles?: string[], offline?: boolean, on_progress?: fun(msg:string) }
+---@param opts table   { active_profiles?: string[], offline?: boolean, on_progress?: fun(msg:string), force?: boolean }
 ---@param callback fun(ok: boolean, project: table|nil, err: string|nil)
 function M.build(root, opts, callback)
   opts = opts or {}
   root = vim.fn.fnamemodify(root, ":p"):gsub("/$", "")
   local key = cache_key(root, opts.active_profiles)
-  if not opts.force and cache[key] then
-    vim.schedule(function() callback(true, cache[key].project) end)
-    return
-  end
 
-  if opts.on_progress then opts.on_progress("java-debug-model: resolving Maven project (mvn)...") end
+  -- The filesystem scan is cheap (a few ms even on a real project) and is
+  -- exactly what BOTH cache layers need to validate themselves against
+  -- (every pom.xml's current mtime) - so it always runs first. Crucially,
+  -- the in-memory cache is re-validated against it too, not just trusted
+  -- forever: a `cache[key]` entry that predates an edited pom.xml (e.g. one
+  -- watcher.lua's fs_event picked up without an explicit force=true) must
+  -- NOT be served stale.
+  M._scan_for_poms(root, function(all_pom_dirs)
+    local current_mtimes = pom_mtimes(all_pom_dirs)
 
-  -- The filesystem scan and the aggregator's effective-pom resolve are
-  -- independent - run them concurrently instead of paying their cost
-  -- sequentially. Both are async (scan never blocks the UI thread either).
-  local all_pom_dirs, aggregate_result
-  local function join()
-    if all_pom_dirs == nil or aggregate_result == nil then return end
-    local ok, stdout, stderr = aggregate_result[1], aggregate_result[2], aggregate_result[3]
-    if not ok then
-      callback(false, nil, "mvn help:effective-pom failed: " .. stderr)
-      return
-    end
-    local parsed_list = M._parse_effective_pom(stdout)
-
-    local project = model.Project.new(root)
-    local reactor_by_path = {}
-    local true_reactor_path = {}
-
-    for _, parsed in ipairs(parsed_list) do
-      if parsed.packaging ~= "pom" and parsed.group_id and parsed.artifact_id then
-        -- effective-pom doesn't print each module's own directory; match by
-        -- artifactId against the filesystem scan (unique enough in practice,
-        -- and the scan already gives us the real directory to resolve
-        -- source roots against).
-        local match_dir = nil
-        for _, dir in ipairs(all_pom_dirs) do
-          if vim.fn.fnamemodify(dir, ":t") == parsed.artifact_id then
-            match_dir = dir
-            break
-          end
-        end
-        match_dir = match_dir or root
-        reactor_by_path[match_dir] = parsed
-        true_reactor_path[match_dir] = true
+    if not opts.force then
+      local mem = cache[key]
+      if mem and mtimes_equal(mem.mtimes, current_mtimes) then
+        callback(true, mem.project)
+        return
       end
-    end
-
-    -- Independent poms found by filesystem scan but not part of the
-    -- aggregator's effective-pom output need their own resolve. `root`
-    -- itself is NEVER a candidate here: it's the aggregator (packaging
-    -- pom, already fully represented by the modules resolved above), and
-    -- re-running `mvn help:effective-pom` directly inside it would just
-    -- re-emit the SAME multi-block reactor output, not a single clean
-    -- block describing root as a leaf.
-    local independent_dirs = {}
-    for _, dir in ipairs(all_pom_dirs) do
-      if dir ~= root and not reactor_by_path[dir] then
-        table.insert(independent_dirs, dir)
-      end
-    end
-
-    local function finalize()
-      for dir, parsed in pairs(reactor_by_path) do
-        project:add_module(M._build_module(dir, parsed, opts.active_profiles or {}, true_reactor_path[dir] == true))
-      end
-      M._resolve_classpaths(project, all_pom_dirs, opts, function()
-        M._mark_sibling_dependencies(project)
-        cache[key] = { project = project, at = vim.loop.now() }
+      local disk_entry = load_disk_cache(root)[key]
+      if disk_entry and disk_entry.mtimes and mtimes_equal(disk_entry.mtimes, current_mtimes) then
+        local project = project_from_cached_modules(root, disk_entry.modules)
+        cache[key] = { project = project, mtimes = current_mtimes, at = vim.loop.now() }
         callback(true, project)
-      end)
+        return
+      end
     end
 
-    -- Never fire all independent-pom resolves at once: each spawns a full
-    -- JVM, so a real project with many independent modules could otherwise
-    -- launch dozens of concurrent mvn processes.
-    run_limited(independent_dirs, MAX_CONCURRENT_MVN, function(dir, done)
-      M._run_maven(dir, { "help:effective-pom" }, { profiles = opts.active_profiles, offline = opts.offline },
-        function(ok2, stdout2)
-          if ok2 then
-            local sub_parsed = M._parse_effective_pom(stdout2)
-            -- Running mvn directly inside `dir` normally yields exactly one
-            -- clean block for `dir` itself. But if `dir` turns out to be a
-            -- nested aggregator too (its own <modules>), it re-emits
-            -- multiple blocks the same way root does - pick the one whose
-            -- artifactId matches dir's own directory name rather than
-            -- blindly trusting block order.
-            local own_name = vim.fn.fnamemodify(dir, ":t")
-            local own_block = nil
-            for _, p in ipairs(sub_parsed) do
-              if p.packaging ~= "pom" and p.artifact_id == own_name then
-                own_block = p
+    if opts.on_progress then opts.on_progress("java-debug-model: resolving Maven project (mvn)...") end
+
+    M._run_maven(root, { "help:effective-pom" }, { profiles = opts.active_profiles, offline = opts.offline },
+      function(ok, stdout, stderr)
+        if not ok then
+          callback(false, nil, "mvn help:effective-pom failed: " .. stderr)
+          return
+        end
+        local parsed_list = M._parse_effective_pom(stdout)
+
+        local project = model.Project.new(root)
+        local reactor_by_path = {}
+        local true_reactor_path = {}
+
+        for _, parsed in ipairs(parsed_list) do
+          if parsed.packaging ~= "pom" and parsed.group_id and parsed.artifact_id then
+            -- effective-pom doesn't print each module's own directory; match
+            -- by artifactId against the filesystem scan (unique enough in
+            -- practice, and the scan already gives us the real directory to
+            -- resolve source roots against).
+            local match_dir = nil
+            for _, dir in ipairs(all_pom_dirs) do
+              if vim.fn.fnamemodify(dir, ":t") == parsed.artifact_id then
+                match_dir = dir
                 break
               end
             end
-            if not own_block and #sub_parsed == 1 and sub_parsed[1].packaging ~= "pom" then
-              own_block = sub_parsed[1]
-            end
-            if own_block then
-              reactor_by_path[dir] = own_block
-            end
+            match_dir = match_dir or root
+            reactor_by_path[match_dir] = parsed
+            true_reactor_path[match_dir] = true
           end
-          done()
-        end)
-    end, finalize)
-  end
+        end
 
-  M._scan_for_poms(root, function(dirs)
-    all_pom_dirs = dirs
-    join()
+        -- Independent poms found by filesystem scan but not part of the
+        -- aggregator's effective-pom output need their own resolve. `root`
+        -- itself is NEVER a candidate here: it's the aggregator (packaging
+        -- pom, already fully represented by the modules resolved above), and
+        -- re-running `mvn help:effective-pom` directly inside it would just
+        -- re-emit the SAME multi-block reactor output, not a single clean
+        -- block describing root as a leaf.
+        local independent_dirs = {}
+        for _, dir in ipairs(all_pom_dirs) do
+          if dir ~= root and not reactor_by_path[dir] then
+            table.insert(independent_dirs, dir)
+          end
+        end
+
+        local function finalize()
+          for dir, parsed in pairs(reactor_by_path) do
+            project:add_module(
+              M._build_module(dir, parsed, opts.active_profiles or {}, true_reactor_path[dir] == true))
+          end
+          M._resolve_classpaths(project, all_pom_dirs, opts, function()
+            M._mark_sibling_dependencies(project)
+            cache[key] = { project = project, mtimes = current_mtimes, at = vim.loop.now() }
+            save_disk_cache(root, key, { mtimes = current_mtimes, modules = project.modules })
+            callback(true, project)
+          end)
+        end
+
+        -- Never fire all independent-pom resolves at once: each spawns a
+        -- full JVM, so a real project with many independent modules could
+        -- otherwise launch dozens of concurrent mvn processes.
+        run_limited(independent_dirs, MAX_CONCURRENT_MVN, function(dir, done)
+          M._run_maven(dir, { "help:effective-pom" }, { profiles = opts.active_profiles, offline = opts.offline },
+            function(ok2, stdout2)
+              if ok2 then
+                local sub_parsed = M._parse_effective_pom(stdout2)
+                -- Running mvn directly inside `dir` normally yields exactly
+                -- one clean block for `dir` itself. But if `dir` turns out to
+                -- be a nested aggregator too (its own <modules>), it
+                -- re-emits multiple blocks the same way root does - pick the
+                -- one whose artifactId matches dir's own directory name
+                -- rather than blindly trusting block order.
+                local own_name = vim.fn.fnamemodify(dir, ":t")
+                local own_block = nil
+                for _, p in ipairs(sub_parsed) do
+                  if p.packaging ~= "pom" and p.artifact_id == own_name then
+                    own_block = p
+                    break
+                  end
+                end
+                if not own_block and #sub_parsed == 1 and sub_parsed[1].packaging ~= "pom" then
+                  own_block = sub_parsed[1]
+                end
+                if own_block then
+                  reactor_by_path[dir] = own_block
+                end
+              end
+              done()
+            end)
+        end, finalize)
+      end)
   end)
-  -- effective-pom at the (aggregator) root gives us all reactor modules in one shot
-  M._run_maven(root, { "help:effective-pom" }, { profiles = opts.active_profiles, offline = opts.offline },
-    function(ok, stdout, stderr)
-      aggregate_result = { ok, stdout, stderr }
-      join()
-    end)
 end
 
 ---@param dir string
