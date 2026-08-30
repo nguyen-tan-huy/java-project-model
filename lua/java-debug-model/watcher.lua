@@ -22,13 +22,11 @@ local function mtime(path)
   return stat and stat.mtime.sec or nil
 end
 
----@param root string
----@param opts table
-local function rebuild(root, opts, callback)
-  -- mvn can easily take 10-60s on a real multi-module project (several
-  -- effective-pom + dependency:build-classpath calls). Without an explicit
-  -- "in progress" notification this reads as Neovim being frozen, since
-  -- nothing else prints while it's running.
+-- mvn can easily take 10-60s on a real multi-module project (several
+-- effective-pom + dependency:build-classpath calls). Without an explicit
+-- "in progress" notification this reads as Neovim being frozen, since
+-- nothing else prints while it's running.
+local function build_with_progress_notice(root, opts, callback)
   local notify_timer = vim.loop.new_timer()
   local notified = false
   notify_timer:start(1500, 0, vim.schedule_wrap(function()
@@ -40,7 +38,18 @@ local function rebuild(root, opts, callback)
 
   maven.build(root, opts, function(ok, project, err)
     if not notify_timer:is_closing() then notify_timer:stop(); notify_timer:close() end
+    if ok and notified then
+      vim.notify("java-debug-model: Maven project resolved (" .. #project.modules .. " modules)",
+        vim.log.levels.INFO)
+    end
+    callback(ok, project, err)
+  end)
+end
 
+---@param root string
+---@param opts table
+local function rebuild(root, opts, callback)
+  build_with_progress_notice(root, opts, function(ok, project, err)
     if not ok then
       vim.notify("java-debug-model: Maven resolve failed: " .. tostring(err), vim.log.levels.ERROR)
       if callback then callback(false, nil) end
@@ -55,10 +64,6 @@ local function rebuild(root, opts, callback)
     M._rewatch(root)
     for _, cb in ipairs(state.on_reload) do
       pcall(cb, project)
-    end
-    if notified then
-      vim.notify("java-debug-model: Maven project resolved (" .. #project.modules .. " modules)",
-        vim.log.levels.INFO)
     end
     if callback then callback(true, project) end
   end)
@@ -128,6 +133,32 @@ function M.get(root, opts, callback)
 
   rebuild(root, opts, function(ok, project)
     callback(ok and project or nil)
+  end)
+end
+
+---Resolves a Project for `root` with a SPECIFIC set of Maven profiles,
+---bypassing the single-project-per-root cache/fs-watch state entirely (that
+---cache has no notion of "which profile combo" it holds, so routing a
+---profile-scoped request through M.get() would silently return whatever
+---happened to be cached from a completely different profile set). Used to
+---run/debug a DebugConfig with its own saved `maven_profiles`, independent
+---of whatever the plugin-wide default project view is showing.
+---
+---Still benefits from resolver/maven.lua's own in-memory + on-disk cache,
+---which IS correctly keyed per (root, profiles) - so repeat runs of the
+---same profile-scoped config are still fast.
+---@param root string
+---@param profiles string[]
+---@param callback fun(project: table|nil)
+function M.get_scoped(root, profiles, callback)
+  root = vim.fn.fnamemodify(root, ":p"):gsub("/$", "")
+  build_with_progress_notice(root, { active_profiles = profiles }, function(ok, project, err)
+    if not ok then
+      vim.notify("java-debug-model: Maven resolve failed: " .. tostring(err), vim.log.levels.ERROR)
+      callback(nil)
+      return
+    end
+    callback(project)
   end)
 end
 

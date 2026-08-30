@@ -20,10 +20,21 @@
 
   <profiles>
     <profile>
+      <!-- profile-dev pulls in an extra dependency (commons-lang3) that is
+           NOT present with no profile active or with profile-prod active -
+           used to verify a DebugConfig's own maven_profiles actually
+           changes the resolved classpath for that specific run. -->
       <id>profile-dev</id>
       <properties>
         <env.name>dev</env.name>
       </properties>
+      <dependencies>
+        <dependency>
+          <groupId>org.apache.commons</groupId>
+          <artifactId>commons-lang3</artifactId>
+          <version>3.14.0</version>
+        </dependency>
+      </dependencies>
     </profile>
     <profile>
       <id>profile-prod</id>

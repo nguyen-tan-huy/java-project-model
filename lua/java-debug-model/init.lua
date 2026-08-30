@@ -140,7 +140,21 @@ end
 ---exclusions.
 ---@param root string
 ---@param callback fun(project: table|nil)
-function M.get_project(root, callback)
+---@param profiles string[]? resolve with these Maven profiles active instead
+---of M.opts.active_profiles - pass a DebugConfig's own `maven_profiles` here
+---to run/debug it with the profile combination it was saved with, resolved
+---independently of the plugin-wide default project view (watcher.lua's
+---single-project-per-root cache has no notion of "which profiles" it
+---holds, so this bypasses it via watcher.get_scoped rather than risk
+---silently returning a project resolved with a different profile set).
+function M.get_project(root, callback, profiles)
+  if profiles and #profiles > 0 then
+    watcher.get_scoped(root, profiles, function(project)
+      if project then project = apply_manifest_exclusions(root, project) end
+      callback(project)
+    end)
+    return
+  end
   watcher.get(root, build_opts(root), function(project)
     if project then
       project = apply_manifest_exclusions(root, project)
@@ -333,15 +347,19 @@ function M.debug_config_scan(root)
 end
 
 function M.debug_config_run(root, name)
+  local cfg = config_store.get(root, name)
+  if not cfg then
+    vim.notify("java-debug-model: no debug config named '" .. name .. "'", vim.log.levels.ERROR)
+    return
+  end
+  -- Resolve with THIS config's own maven_profiles, not the plugin-wide
+  -- default - otherwise a config saved with e.g. profile "dev" would
+  -- silently launch against whatever profile set setup() was given
+  -- instead, defeating the point of the per-config field entirely.
   M.get_project(root, function(project)
     if not project then return end
-    local cfg = config_store.get(root, name)
-    if not cfg then
-      vim.notify("java-debug-model: no debug config named '" .. name .. "'", vim.log.levels.ERROR)
-      return
-    end
     dap.launch(project, cfg, { open_j9_java_exec = M.opts.open_j9_java_exec })
-  end)
+  end, cfg.maven_profiles)
 end
 
 function M.debug_config_add(root)
