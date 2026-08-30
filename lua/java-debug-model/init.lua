@@ -24,11 +24,28 @@ M.opts = {
   jdtls_bundle_globs = {},
 }
 
+-- The root most recently resolved from a real file buffer. Falling back to
+-- vim.fn.getcwd() when the current buffer isn't inside any project is wrong
+-- the moment the user runs a :Java* command while one of this plugin's own
+-- scratch panels (project tree, Maven panel, test results...) happens to be
+-- the focused window - those buffers are unnamed/nofile, so find_root(0)
+-- would silently resolve to wherever Neovim was launched from instead of the
+-- project the user is actually working in. Remembering the last real root
+-- and falling back to THAT instead keeps every :Java* command consistent
+-- regardless of which window currently has focus.
+local last_root = nil
+
 ---@return string root - the workspace root for the current buffer, found by
----walking up for a pom.xml, falling back to cwd.
+---walking up for a pom.xml, falling back to the last resolved root (or cwd
+---if none yet) when the current buffer isn't a real file inside a project.
 local function find_root(bufnr)
   local bufname = vim.api.nvim_buf_get_name(bufnr or 0)
-  local start = bufname ~= "" and vim.fn.fnamemodify(bufname, ":h") or vim.fn.getcwd()
+  local is_own_panel = bufname:match("^java%-debug%-model://") ~= nil
+  if bufname == "" or is_own_panel then
+    return last_root or vim.fn.getcwd()
+  end
+
+  local start = vim.fn.fnamemodify(bufname, ":h")
   local found = vim.fs.find("pom.xml", { path = start, upward = true })[1]
   if found then
     -- walk further up while a parent pom.xml exists (find the reactor root)
@@ -41,9 +58,10 @@ local function find_root(bufnr)
         break
       end
     end
+    last_root = dir
     return dir
   end
-  return vim.fn.getcwd()
+  return last_root or vim.fn.getcwd()
 end
 
 local function manifest_path(root)
