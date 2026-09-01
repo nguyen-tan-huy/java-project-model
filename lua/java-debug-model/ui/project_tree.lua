@@ -1,6 +1,8 @@
 -- Project -> Module -> SourceRoot -> files tree, replacing a raw filesystem
 -- tree like neo-tree. Lazy-loaded per expand via vim.loop.fs_scandir, never
 -- an eager full walk.
+local panel_registry = require("java-debug-model.ui.panel_registry")
+
 local M = {}
 
 ---@class TreeNode
@@ -318,9 +320,14 @@ local function get_or_create_target_win()
     return state.target_winid
   end
 
-  -- Fall back to any other non-floating window that isn't the tree itself.
+  -- Fall back to any other non-floating window that isn't the tree itself OR one of this
+  -- plugin's own OTHER utility panels (Maven Lifecycle, Dependency Tree, Session Manager...) -
+  -- without the panel_registry check, a file opened from the tree could land INSIDE one of
+  -- those instead of a real editor window (confirmed for real: it picked Session Manager's
+  -- profile list).
   for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if win ~= state.tree_winid and vim.api.nvim_win_get_config(win).relative == "" then
+    if win ~= state.tree_winid and not panel_registry.is_known(win)
+        and vim.api.nvim_win_get_config(win).relative == "" then
       state.target_winid = win
       restore_editor_window_options(win)
       return win
@@ -440,6 +447,18 @@ local function delete_at_cursor()
   end)
 end
 
+---@return boolean
+function M.is_open()
+  return state.tree_winid ~= nil and vim.api.nvim_win_is_valid(state.tree_winid)
+end
+
+function M.close()
+  if M.is_open() then
+    vim.api.nvim_win_close(state.tree_winid, false)
+  end
+  state.tree_winid = nil
+end
+
 ---Opens (or focuses) the project tree window for `root`'s Project model.
 ---@param root string
 ---@param project table Project
@@ -471,7 +490,8 @@ function M.open(root, project)
     -- window" (`wincmd p`), which drifts as focus moves around and can end
     -- up pointing back at the tree itself.
     local previous_win = vim.api.nvim_get_current_win()
-    if previous_win ~= state.tree_winid and vim.api.nvim_win_get_config(previous_win).relative == "" then
+    if previous_win ~= state.tree_winid and not panel_registry.is_known(previous_win)
+        and vim.api.nvim_win_get_config(previous_win).relative == "" then
       state.target_winid = previous_win
     end
 
@@ -486,6 +506,13 @@ function M.open(root, project)
     wo.wrap = false
     wo.cursorline = true
     wo.winfixwidth = true
+
+    panel_registry.register(state.tree_winid)
+    vim.api.nvim_create_autocmd("WinClosed", {
+      pattern = tostring(state.tree_winid),
+      once = true,
+      callback = function() panel_registry.unregister(state.tree_winid) end,
+    })
   end
   render()
 end

@@ -93,6 +93,16 @@ function M.launch(project, config, opts)
     profiles = config.maven_profiles,
   })
 
+  -- Tự gắn 1 marker DUY NHẤT (theo session_id) vào chính vmArgs của debuggee - session.lua's
+  -- wait_release_then dùng `pgrep -f` trên marker này để tra ĐÚNG PID JVM thật khi terminate,
+  -- không phụ thuộc port có bắt được từ console log hay không (xem session.lua's
+  -- M.marker_for comment: java-debug adapter luôn stream qua OutputEvent, KHÔNG BAO GIỜ dùng
+  -- runInTerminal, nên port-based tracking trước đây thực ra không bao giờ kích hoạt cho Java -
+  -- đây là nguyên nhân thật của "stop session lúc được lúc mất").
+  local marker = "-D" .. session.marker_for(session_id)
+  dap_config.vmArgs = (dap_config.vmArgs and dap_config.vmArgs ~= "")
+      and (dap_config.vmArgs .. " " .. marker) or marker
+
   -- nvim-dap's dap.run(config, opts) only supports opts.before/opts.new -
   -- there is no "after" hook, dap.run() doesn't return the Session it
   -- creates (session creation happens asynchronously, after the adapter

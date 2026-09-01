@@ -13,7 +13,17 @@ local M = {}
 ---(DAP bundle) and java-test (JUnit/TestNG bundle). Safe to call every
 ---startup - checked+skipped instantly once installed, mason-registry itself
 ---dedupes concurrent installs.
+---
+---Calls require("mason").setup() itself first (pcall'd, idempotent - safe even if some OTHER
+---config file already called it with its own options, e.g. a custom install root) rather than
+---assuming the consuming config's own plugins/lsp.lua (or equivalent) already did: mason.nvim is
+---now a listed `dependencies` entry of this plugin's own lazy.nvim spec, but lazy.nvim only
+---INSTALLS/loads a listed dependency - it never calls that plugin's own setup() for you.
+---mason-registry works with reasonable defaults even without an explicit setup() call in
+---practice, but calling it here removes the implicit "some other file already did this" assumption
+---entirely - "install java-debug-model" alone is then really enough.
 function M.ensure_mason_packages()
+  pcall(function() require("mason").setup() end)
   local ok_registry, registry = pcall(require, "mason-registry")
   if not ok_registry then return end
   for _, name in ipairs({ "jdtls", "java-debug-adapter", "java-test" }) do

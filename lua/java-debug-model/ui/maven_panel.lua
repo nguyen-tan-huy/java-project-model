@@ -11,6 +11,7 @@
 -- A "Skip Tests" toggle (T) shown in the header, applying -DskipTests to
 -- subsequent runs via maven_runner.skip_tests.
 local maven_runner = require("java-debug-model.maven_runner")
+local panel_registry = require("java-debug-model.ui.panel_registry")
 
 local M = {}
 
@@ -238,7 +239,8 @@ function M.open(root, project)
 
   vim.cmd("botright 40vsplit")
   vim.api.nvim_win_set_buf(0, state.bufnr)
-  local wo = vim.wo[0]
+  local winid = vim.api.nvim_get_current_win()
+  local wo = vim.wo[winid]
   wo.number = false
   wo.relativenumber = false
   wo.signcolumn = "no"
@@ -246,6 +248,14 @@ function M.open(root, project)
   wo.wrap = false
   wo.cursorline = true
   wo.winfixwidth = true
+
+  panel_registry.register(winid)
+  vim.api.nvim_create_autocmd("WinClosed", {
+    pattern = tostring(winid),
+    once = true,
+    callback = function() panel_registry.unregister(winid) end,
+  })
+
   render()
 end
 

@@ -17,6 +17,36 @@ local M = {}
 local sessions = {}
 local next_id = 1
 
+---@param id integer
+---@return string  a fixed, unique-per-session marker string - dap.lua's M.launch injects this as
+---`-D<marker>` into the debuggee's OWN vmArgs, so wait_release_then below can find the ACTUAL JVM
+---process by grepping its command line, regardless of console mode. THE PORT-BASED CHECK THIS
+---REPLACED NEVER ACTUALLY WORKED for Java: dap_status.ports only gets populated by
+---plugins/dap.lua's terminal_win_cmd, which nvim-dap only calls for adapters using runInTerminal -
+---java-debug (jdtls's own DAP adapter) never requests that, it always streams output via
+---OutputEvent straight to the REPL instead (see plugins/dap.lua's own comment on this) - so
+---dap_status.ports[name] was always nil for every Java session, meaning "no port -> trust the DAP
+---protocol immediately" was silently the ONLY path ever taken, on every single stop, regardless of
+---whether the JVM actually exited - hence "works sometimes, doesn't others" reported by a real
+---user: whatever made the JVM actually die was pure luck/unrelated to this fallback, not this
+---fallback engaging correctly.
+function M.marker_for(id)
+  return "java-debug-model.session-id=" .. id
+end
+
+---@param marker string
+---@return integer[]
+local function pids_matching_marker(marker)
+  if vim.fn.executable("pgrep") == 0 then return {} end
+  local out = vim.fn.systemlist({ "pgrep", "-f", marker })
+  local pids = {}
+  for _, line in ipairs(out) do
+    local pid = tonumber(vim.trim(line))
+    if pid then table.insert(pids, pid) end
+  end
+  return pids
+end
+
 ---@param port string|integer
 ---@return integer[]
 local function pids_listening_on_port(port)
@@ -30,43 +60,58 @@ local function pids_listening_on_port(port)
   return pids
 end
 
----Đợi tối đa `max_wait` ms xem debuggee (theo port lua/dap_status.lua đã bắt được từ log console
----- xem plugins/dap.lua's terminal_win_cmd, hook CHUNG cho MỌI dap session bất kể khởi động qua
----đường nào) đã thoát thật chưa, rồi mới gọi cb(). BẮT BUỘC phải làm vậy: đã xác nhận qua log
----TRACE (xem comment ở plugins/dap.lua) - java-debug adapter của jdtls trả lời
----disconnect(terminateDebuggee=true) là success=true, bắn event "terminated", nhưng JVM thật
----KHÔNG thoát (bug/giới hạn thật của adapter, không phải lỗi cấu hình) - :JavaSessionStop dùng
----thẳng disconnect() nên dính đúng bug này nếu không có bước tự tra-PID-rồi-kill này. Không có
----port đã bắt được (vd chưa kịp bắt log, hoặc app không in "started on port") thì tin theo DAP
----protocol coi như đã tắt, không có cách nào tự tra PID khác an toàn hơn.
----@param name string
+---Đợi tối đa `max_wait` ms xem debuggee đã thoát thật chưa (qua `pgrep -f` trên vmArgs marker
+---của CHÍNH session này - luôn có, không phụ thuộc console mode/port có bắt được hay không; kết
+---hợp thêm port-based lsof check nếu dap_status.ports[entry.name] tình cờ có, làm tín hiệu phụ)
+---rồi mới gọi cb(). BẮT BUỘC phải làm vậy: đã xác nhận qua log TRACE (xem comment ở
+---plugins/dap.lua) - java-debug adapter của jdtls trả lời disconnect(terminateDebuggee=true) là
+---success=true, bắn event "terminated", nhưng JVM thật KHÔNG thoát (bug/giới hạn thật của
+---adapter, không phải lỗi cấu hình). Chỉ "tin theo DAP protocol" ngay khi KHÔNG signal nào tra
+---được cả (pgrep không có sẵn VÀ không có port) - trường hợp cực hiếm, không có cách nào khác.
+---@param entry SessionEntry
 ---@param cb fun()
 ---@param max_wait integer?
-local function wait_release_then(name, cb, max_wait)
+local function wait_release_then(entry, cb, max_wait)
   max_wait = max_wait or 5000
   local ok_status, dap_status = pcall(require, "dap_status")
-  local port = ok_status and dap_status.ports[name]
-  if not port then
+  local marker = M.marker_for(entry.id)
+
+  local function alive_pids()
+    local pids = {}
+    for _, pid in ipairs(pids_matching_marker(marker)) do pids[pid] = true end
+    local port = ok_status and dap_status.ports[entry.name]
+    if port then
+      for _, pid in ipairs(pids_listening_on_port(port)) do pids[pid] = true end
+    end
+    return pids
+  end
+
+  if not next(alive_pids()) then
+    -- Either already gone, or neither signal is available at all (pgrep missing AND no port
+    -- captured) - nothing left to poll for, trust the DAP protocol.
     cb()
     return
   end
+
   local uv = vim.uv or vim.loop
   local elapsed = 0
   local interval = 500
   local function check()
-    local pids = pids_listening_on_port(port)
-    if #pids == 0 then
-      dap_status.ports[name] = nil
+    local pids = alive_pids()
+    if not next(pids) then
+      if ok_status then dap_status.ports[entry.name] = nil end
       cb()
       return
     end
     elapsed = elapsed + interval
     if elapsed >= max_wait then
-      for _, pid in ipairs(pids) do uv.kill(pid, 9) end -- SIGKILL
-      dap_status.ports[name] = nil
+      for pid in pairs(pids) do uv.kill(pid, 9) end -- SIGKILL
+      if ok_status then dap_status.ports[entry.name] = nil end
+      local pid_list = vim.tbl_keys(pids)
+      table.sort(pid_list)
       vim.notify(
         string.format("java-debug-model: '%s' không tự tắt sau terminate - đã force-kill PID %s.",
-          name, table.concat(pids, ", ")),
+          entry.name, table.concat(pid_list, ", ")),
         vim.log.levels.WARN)
       cb()
       return
@@ -155,7 +200,7 @@ function M.terminate(id, on_stopped)
         return
       end
       local ok, err = pcall(entry.dap_session.disconnect, entry.dap_session, { terminateDebuggee = true }, function()
-        wait_release_then(entry.name, function()
+        wait_release_then(entry, function()
           M.mark_stopped(id)
           if on_stopped then on_stopped() end
         end)
@@ -164,7 +209,7 @@ function M.terminate(id, on_stopped)
         vim.notify("java-debug-model: session.terminate failed: " .. tostring(err), vim.log.levels.WARN)
         -- disconnect() request itself never went through - vẫn thử tra PID theo port (không phụ
         -- thuộc việc disconnect có thành công hay không) trước khi coi như xong.
-        wait_release_then(entry.name, function()
+        wait_release_then(entry, function()
           M.mark_stopped(id)
           if on_stopped then on_stopped() end
         end)
@@ -201,6 +246,18 @@ function M.restart(id)
   end
   vim.notify("java-debug-model: restarting '" .. entry.name .. "'...", vim.log.levels.INFO)
   M.terminate(id, function()
+    -- Drop the OLD entry now that its debuggee is confirmed gone - debug_config_run below always
+    -- registers a FRESH entry with its own new id (an nvim-dap Session object can't be relaunched
+    -- in place, dap.launch always creates a new one), so without this the old row would linger
+    -- forever as its own separate "stopped" entry sitting next to the new one instead of the
+    -- restart actually replacing it - which is the whole point callers (e.g.
+    -- ui/session_manager.lua's "run this profile" reusing the existing row instead of piling up
+    -- a new one every run) rely on this function for.
+    local kept = {}
+    for _, e in ipairs(sessions) do
+      if e.id ~= id then table.insert(kept, e) end
+    end
+    sessions = kept
     require("java-debug-model").debug_config_run(entry.root, entry.name)
   end)
 end
@@ -225,8 +282,24 @@ function M.remove(id)
   sessions = kept
 end
 
+---@return boolean  true if some dapui element (Scopes/Watches/Stacks/Breakpoints/REPL) is
+---currently showing in a window of the current tab - dapui itself exposes no public "is open"
+---check, so this looks for a window whose buffer filetype starts with "dapui" (every element
+---buffer is named that way, e.g. "dapui_scopes" - see nvim-dap-ui/lua/dapui/elements/*.lua).
+local function dapui_is_open()
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    local ft = vim.bo[vim.api.nvim_win_get_buf(win)].filetype
+    if ft:match("^dapui") then return true end
+  end
+  return false
+end
+
 ---Switches nvim-dap-ui's focus to the given session's dap Session, without
----affecting the state of any other running session.
+---affecting the state of any other running session. Only re-opens dapui if it's ALREADY visible
+---(keeping it in sync with whichever session you just switched to) - doesn't force it open from
+---closed: java-debug-model no longer auto-pops dapui on every debug launch (see plugins/dap.lua's
+---own comment on this), so focusing a session from ui/session_manager.lua's 'f' key shouldn't
+---silently undo that and pop it open either.
 ---@param id integer
 function M.focus(id)
   for _, entry in ipairs(sessions) do
@@ -235,14 +308,62 @@ function M.focus(id)
       if ok then
         dap.set_session(entry.dap_session)
       end
-      local ok_ui, dapui = pcall(require, "dapui")
-      if ok_ui then
-        dapui.open()
+      if dapui_is_open() then
+        local ok_ui, dapui = pcall(require, "dapui")
+        if ok_ui then dapui.open() end
       end
       return true
     end
   end
   return false
+end
+
+---Captures each tracked session's OWN `OutputEvent` stream into its OWN dedicated buffer
+---(dap_status.term_bufs[entry.name], the SAME shared table plugins/dap.lua's terminal_win_cmd
+---populates for runInTerminal-based adapters) - java-debug (jdtls's own DAP adapter) never uses
+---runInTerminal, it ALWAYS streams output via OutputEvent straight into nvim-dap's ONE GLOBAL
+---REPL buffer instead (see nvim-dap's own Session:event_output - no per-session routing at all).
+---Without this, EVERY Java session's "log" in ui/session_manager.lua fell back to that SAME
+---shared REPL buffer, indistinguishable from one another - confirmed for real: running a SECOND
+---profile made the FIRST profile's row in the panel show the SECOND one's log instead (whichever
+---was actively streaming to the shared REPL), while the actively-running one's own row showed
+---nothing new (the log pane's buffer was already set to that REPL buf from a previous selection,
+---so the "only update on buffer change" check silently skipped refreshing the view).
+---@param dap table  the nvim-dap module (passed in so callers already holding a reference reuse it)
+local function setup_output_capture(dap)
+  dap.listeners.after.event_output["java-debug-model-log"] = function(dap_session, body)
+    if body.category == "telemetry" then return end
+    local entry
+    for _, e in ipairs(sessions) do
+      if e.dap_session == dap_session then
+        entry = e
+        break
+      end
+    end
+    if not entry then return end -- not one of OUR tracked sessions (e.g. a Rust/codelldb session) - leave it alone
+
+    local ok_status, dap_status = pcall(require, "dap_status")
+    if not ok_status then return end
+
+    local buf = dap_status.term_bufs[entry.name]
+    if not (buf and vim.api.nvim_buf_is_valid(buf)) then
+      buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[buf].bufhidden = "hide"
+      dap_status.term_bufs[entry.name] = buf
+    end
+
+    -- Append body.output the same way nvim-dap's own REPL does: text may contain embedded
+    -- newlines and doesn't arrive pre-split into "lines" - continue the LAST existing line
+    -- rather than always starting a fresh one, so output split across multiple OutputEvents
+    -- mid-line doesn't get torn onto separate lines.
+    local pieces = vim.split(body.output, "\n", { plain = true })
+    local last_idx = vim.api.nvim_buf_line_count(buf)
+    local last_line = vim.api.nvim_buf_get_lines(buf, last_idx - 1, last_idx, false)[1] or ""
+    vim.api.nvim_buf_set_lines(buf, last_idx - 1, last_idx, false, { last_line .. pieces[1] })
+    if #pieces > 1 then
+      vim.api.nvim_buf_set_lines(buf, last_idx, last_idx, false, { unpack(pieces, 2) })
+    end
+  end
 end
 
 ---Wires nvim-dap's global listeners once, so every session this registry
@@ -251,6 +372,7 @@ end
 function M.setup_listeners()
   local ok, dap = pcall(require, "dap")
   if not ok then return end
+  setup_output_capture(dap)
   dap.listeners.after.event_terminated["java-debug-model"] = function(dap_session)
     for _, entry in ipairs(sessions) do
       if entry.dap_session == dap_session then
@@ -300,7 +422,7 @@ function M.terminate_all_sync(timeout_ms)
       -- `pending` above could leave the registry saying "running" for a
       -- session whose JVM is already dead.
       local ok, err = pcall(entry.dap_session.disconnect, entry.dap_session, { terminateDebuggee = true }, function()
-        wait_release_then(entry.name, function()
+        wait_release_then(entry, function()
           M.mark_stopped(entry.id)
           pending = pending - 1
         end)
@@ -309,7 +431,7 @@ function M.terminate_all_sync(timeout_ms)
         vim.schedule(function()
           vim.notify("java-debug-model: session.disconnect failed: " .. tostring(err), vim.log.levels.WARN)
         end)
-        wait_release_then(entry.name, function()
+        wait_release_then(entry, function()
           M.mark_stopped(entry.id)
           pending = pending - 1
         end)

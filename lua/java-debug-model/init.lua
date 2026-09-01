@@ -20,6 +20,18 @@ local session_manager_ui = require("java-debug-model.ui.session_manager")
 
 local M = {}
 
+-- Prebuilt, already-patched jdtls 1.54.0 (2 real jdt.ls bugs fixed - stale "directories" field
+-- across multiple scanned root paths, and a null parent pom for a module scanned in isolation
+-- with an empty <relativePath/> - see eclipse.jdt.ls-build's local-patches branch commit log for
+-- the full writeup) built via the project's own full Tycho product build and published as a
+-- GitHub Release asset on THIS repo. Baked in as the DEFAULT here (not left for every caller to
+-- fill in via opts, as an earlier version of this file did) so "install java-debug-model, call
+-- setup()" is the whole Java setup story end to end - no separate step to go find/build/host a
+-- working jdtls distribution. Override via opts.jdtls_prebuilt_url (a different release) or set
+-- to `false` to skip entirely and fall through to jdtls_launcher.lua's Mason fallback instead.
+local DEFAULT_JDTLS_PREBUILT_URL =
+  "https://github.com/nguyen-tan-huy/eclipse.jdt.ls/releases/download/1.54.0/jdt-language-server-1.54.0-202609010342.tar.gz"
+
 M.opts = {
   auto_attach = false,
   active_profiles = {},
@@ -35,12 +47,11 @@ M.opts = {
   -- skip spring-boot.nvim wiring entirely.
   spring_boot_ls_path = nil,
   -- URL of a prebuilt, already-patched jdtls .tar.gz GitHub Release asset (see
-  -- eclipse.jdt.ls-build's local-patches branch + bootstrap.lua's
-  -- ensure_jdtls_prebuilt) - nil (default) skips this entirely, meaning a
-  -- machine missing jdtls_prebuilt_dest falls straight through to
-  -- jdtls_launcher.lua's own Mason fallback (a DIFFERENT, unpatched jdtls
-  -- version) instead. Set this once you've published a release so a fresh
-  -- machine gets the patched build with no local Tycho build ever required.
+  -- DEFAULT_JDTLS_PREBUILT_URL above + bootstrap.lua's ensure_jdtls_prebuilt).
+  -- nil (default) uses DEFAULT_JDTLS_PREBUILT_URL; pass a different URL to
+  -- pull a different release, or `false` to skip this entirely and fall
+  -- straight through to jdtls_launcher.lua's Mason fallback (a DIFFERENT,
+  -- unpatched jdtls version) instead.
   jdtls_prebuilt_url = nil,
   -- Where to extract that release asset into - defaults to the exact path
   -- jdtls_launcher.lua's build_config looks up FIRST (see its own jdtls_path
@@ -218,6 +229,51 @@ function M.get_project(root, callback, profiles)
     end
     callback(project)
   end)
+end
+
+---Closes then reopens every currently-open "IDE layout" panel (Project Tree, Maven Lifecycle,
+---Session Manager) in a FIXED order (tree first, then session manager, then maven panel) so
+---their window geometry comes out the same every time, regardless of what order they happened to
+---be opened in originally. Neovim's plain window-split model has no notion of "docking zones"
+---like IntelliJ's tool windows do - `topleft`/`botright` splits each just carve out a slice of
+---the WHOLE tab, so opening/closing several of these independently-positioned panels in different
+---orders can squash one into a sliver (confirmed for real: reopening Project Tree while Session
+---Manager's bottom band was already open left Session Manager's own list column squeezed down to
+---~10 characters wide). This is the "fix the layout" escape hatch for when that happens - a
+---from-scratch relayout is simpler and more robust than trying to detect/correct a squashed
+---window after the fact.
+---
+---Doesn't touch Dependency Tree: that panel is a "look something up right now" tool by design
+---(see its own doc comment - always re-runs `mvn dependency:tree` fresh on open, no cache), not
+---part of the persistent IDE-like layout the other three panels form together.
+---@param root string
+function M.reset_layout(root)
+  local was_tree_open = project_tree.is_open()
+  local was_maven_open = maven_panel.is_open()
+  local was_session_open = session_manager_ui.is_open()
+
+  project_tree.close()
+  maven_panel.close()
+  session_manager_ui.close()
+
+  if not (was_tree_open or was_maven_open or was_session_open) then
+    vim.notify("java-debug-model: không có panel nào đang mở để sắp xếp lại.", vim.log.levels.INFO)
+    return
+  end
+
+  local function reopen_session_then_maven(project)
+    if was_session_open then session_manager_ui.open() end
+    if was_maven_open and project then maven_panel.open(root, project) end
+  end
+
+  if was_tree_open or was_maven_open then
+    M.get_project(root, function(project)
+      if project and was_tree_open then project_tree.open(root, project) end
+      reopen_session_then_maven(project)
+    end)
+  else
+    reopen_session_then_maven(nil)
+  end
 end
 
 ---Starts/attaches jdtls for `bufnr` - the WHOLE launch (Mason paths, ASM
@@ -483,8 +539,14 @@ function M.setup(opts)
   local bootstrap = require("java-debug-model.bootstrap")
   -- Chạy TRƯỚC ensure_mason_packages: nếu tải/giải nén thành công, dest đã có sẵn trước khi
   -- jdtls_launcher.lua's build_config tìm tới nó, nên không bao giờ rơi vào nhánh fallback
-  -- Mason (jdtls_prebuilt_url = nil mặc định thì hàm này no-op ngay dòng đầu).
-  bootstrap.ensure_jdtls_prebuilt({ url = M.opts.jdtls_prebuilt_url, dest = M.opts.jdtls_prebuilt_dest })
+  -- Mason. jdtls_prebuilt_url = nil (mặc định) dùng DEFAULT_JDTLS_PREBUILT_URL; = false thì
+  -- bỏ qua hẳn bước này (hàm no-op ngay dòng đầu).
+  if M.opts.jdtls_prebuilt_url ~= false then
+    bootstrap.ensure_jdtls_prebuilt({
+      url = M.opts.jdtls_prebuilt_url or DEFAULT_JDTLS_PREBUILT_URL,
+      dest = M.opts.jdtls_prebuilt_dest,
+    })
+  end
   bootstrap.ensure_mason_packages()
   if M.opts.spring_boot_ls_path ~= false then
     bootstrap.setup_spring_boot({ ls_path = M.opts.spring_boot_ls_path })

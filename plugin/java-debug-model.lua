@@ -142,3 +142,5 @@ command("JavaProjectTree", function()
     if project then jdm().project_tree.open(current_root(), project) end
   end)
 end, {})
+
+command("JavaLayoutReset", function() jdm().reset_layout(current_root()) end, {})

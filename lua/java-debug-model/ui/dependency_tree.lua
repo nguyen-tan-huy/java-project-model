@@ -17,6 +17,7 @@
 --      matching lines plus their ancestor chain (computed from the tree's own indentation), so
 --      the path to each match stays visible - same idea as IntelliJ's Dependency Analyzer search.
 local maven = require("java-debug-model.resolver.maven")
+local panel_registry = require("java-debug-model.ui.panel_registry")
 
 local M = {}
 
@@ -258,6 +259,13 @@ function M.open(module, opts)
     wo.foldcolumn = "0"
     wo.wrap = false
     wo.cursorline = true
+
+    panel_registry.register(state.winid)
+    vim.api.nvim_create_autocmd("WinClosed", {
+      pattern = tostring(state.winid),
+      once = true,
+      callback = function() panel_registry.unregister(state.winid) end,
+    })
   end
 
   refresh()
