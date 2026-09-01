@@ -88,6 +88,7 @@ function M.launch(project, config, opts)
 
   local session_id = session.register({
     name = dap_config.name,
+    root = project.root,
     module_path = config.module_path,
     profiles = config.maven_profiles,
   })

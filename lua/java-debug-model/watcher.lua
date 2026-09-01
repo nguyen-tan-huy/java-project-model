@@ -150,9 +150,14 @@ end
 ---@param root string
 ---@param profiles string[]
 ---@param callback fun(project: table|nil)
-function M.get_scoped(root, profiles, callback)
+---@param base_opts table?  manually_added/excluded from the caller's manifest -
+---without these, a manually-added module (:JavaModelAddModule) silently drops
+---out of any profile-scoped resolve, e.g. :JavaDebugConfigRun on a config that
+---also sets its own maven_profiles.
+function M.get_scoped(root, profiles, callback, base_opts)
   root = vim.fn.fnamemodify(root, ":p"):gsub("/$", "")
-  build_with_progress_notice(root, { active_profiles = profiles }, function(ok, project, err)
+  local opts = vim.tbl_extend("force", base_opts or {}, { active_profiles = profiles })
+  build_with_progress_notice(root, opts, function(ok, project, err)
     if not ok then
       vim.notify("java-debug-model: Maven resolve failed: " .. tostring(err), vim.log.levels.ERROR)
       callback(nil)

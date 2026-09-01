@@ -9,6 +9,22 @@ local M = {}
 ---@type table<string, {project: table, at: integer}>
 local cache = {}
 
+-- Tracked so a statusline component can show "resolving Maven..." while
+-- real mvn processes are in flight, instead of relying solely on the
+-- transient vim.notify (see watcher.lua's progress notice) which is easy
+-- to miss and doesn't persist for the whole duration.
+local active_mvn_count = 0
+
+---@return integer  number of `mvn` invocations currently in flight
+function M.active_mvn_count()
+  return active_mvn_count
+end
+
+---@return boolean  true while at least one `mvn` invocation is running
+function M.is_busy()
+  return active_mvn_count > 0
+end
+
 local function cache_key(module_path, profiles)
   local sorted = vim.deepcopy(profiles or {})
   table.sort(sorted)
@@ -88,8 +104,10 @@ function M._run_maven(root, args, opts, callback)
   end
   table.insert(cmd, "-B") -- batch mode: no interactive prompts, cleaner output
 
+  active_mvn_count = active_mvn_count + 1
   vim.system(cmd, { cwd = root, text = true }, function(result)
     vim.schedule(function()
+      active_mvn_count = active_mvn_count - 1
       callback(result.code == 0, result.stdout or "", result.stderr or "")
     end)
   end)
@@ -395,6 +413,24 @@ function M.build(root, opts, callback)
   -- watcher.lua's fs_event picked up without an explicit force=true) must
   -- NOT be served stale.
   M._scan_for_poms(root, function(all_pom_dirs)
+    -- :JavaModelAddModule persists manually-added modules to the manifest
+    -- and passes them through here as opts.manually_added, but a module
+    -- added from OUTSIDE root's own directory tree (the whole point of
+    -- that command - an independent pom not reachable by scanning root)
+    -- would otherwise never appear in all_pom_dirs at all, so it would
+    -- silently drop out of the resolved Project. It then hits jdtls's live
+    -- workspace via notify_workspace_folder_change, but :JavaDebugConfigRun
+    -- (and any other Project-based lookup) would fail with "module not
+    -- found" since the model never actually contains it. Merge it in here
+    -- so it flows through the same independent-pom resolve path as any
+    -- other non-reactor module found by the scan.
+    for _, added_dir in ipairs(opts.manually_added or {}) do
+      added_dir = vim.fn.fnamemodify(added_dir, ":p"):gsub("/$", "")
+      if vim.fn.filereadable(added_dir .. "/pom.xml") == 1 and not vim.tbl_contains(all_pom_dirs, added_dir) then
+        table.insert(all_pom_dirs, added_dir)
+      end
+    end
+
     local current_mtimes = pom_mtimes(all_pom_dirs)
 
     if not opts.force then

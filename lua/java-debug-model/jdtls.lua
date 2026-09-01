@@ -156,29 +156,79 @@ end
 ---Sends workspace/didChangeWorkspaceFolders to every attached jdtls client so
 ---a module discovered outside the originally-scanned root (or manually added
 ---via :JavaModelAddModule) gets imported without restarting jdtls.
+---
+---Goes through the client's own `_add_workspace_folder`/`_remove_workspace_folder`
+---(the same internal methods `vim.lsp.buf.add_workspace_folder()` uses) rather
+---than hand-building the notification: those also update `client.workspace_folders`
+---itself, which sync_workspace_folders below relies on to know what's already
+---imported - sending the raw notification without that would make every sync
+---re-"add" the same module again and again.
 ---@param module_path string
 ---@param action "added"|"removed"
 function M.notify_workspace_folder_change(module_path, action)
   local clients = vim.lsp.get_clients({ name = "jdtls" })
-  if #clients == 0 then return end
-  local uri = vim.uri_from_fname(module_path)
-  local name = vim.fn.fnamemodify(module_path, ":t")
   for _, client in ipairs(clients) do
     if action == "added" then
-      client:notify("workspace/didChangeWorkspaceFolders", {
-        event = { added = { { uri = uri, name = name } }, removed = {} },
-      })
+      client:_add_workspace_folder(module_path)
     else
-      client:notify("workspace/didChangeWorkspaceFolders", {
-        event = { added = {}, removed = { { uri = uri, name = name } } },
-      })
+      client:_remove_workspace_folder(module_path)
     end
   end
 end
 
----Triggers jdtls's incremental "reload maven project" for a single pom.xml
----change: java.projectConfiguration.update, NOT a jdtls restart - the JVM
----stays alive, only the affected project's import is refreshed.
+---Ensures every attached jdtls client's live workspace folders include
+---every module the current Project model knows about - reactor-declared
+---modules AND independent/"orphan" poms found by maven.lua's own recursive
+---filesystem scan (resolver/maven.lua's M._scan_for_poms walks the WHOLE
+---tree, not just root's direct children) - so this is a strict superset of,
+---and replaces, any hand-rolled "scan root's immediate subdirectories for
+---an undeclared pom.xml" logic: the Project model is already the single
+---source of truth for "what modules make up this project", there is no
+---need to re-derive that separately just to decide what jdtls should import.
+---@param project table Project
+---@return string[] module paths newly added this call
+function M.sync_workspace_folders(project)
+  local clients = vim.lsp.get_clients({ name = "jdtls" })
+  if #clients == 0 then return {} end
+
+  local existing = {}
+  for _, client in ipairs(clients) do
+    existing[vim.fn.fnamemodify(client.config.root_dir or "", ":p"):gsub("/$", "")] = true
+    for _, wf in ipairs(client.workspace_folders or {}) do
+      existing[vim.fn.fnamemodify(vim.uri_to_fname(wf.uri), ":p"):gsub("/$", "")] = true
+    end
+  end
+
+  local added = {}
+  for _, mod in ipairs(project.modules) do
+    local path = vim.fn.fnamemodify(mod.path, ":p"):gsub("/$", "")
+    if not existing[path] then
+      M.notify_workspace_folder_change(mod.path, "added")
+      existing[path] = true
+      table.insert(added, mod.path)
+    end
+  end
+  return added
+end
+
+---Triggers jdtls's incremental "reload maven project" (reimport + rebuild)
+---for a single pom.xml, NOT a jdtls restart - the JVM stays alive, only the
+---affected project's import is refreshed.
+---
+---Sends the CUSTOM LSP method `java/projectConfigurationUpdate` directly
+---(client:request, like textDocument/definition) - the same thing
+---nvim-jdtls's own jdtls.update_project_config() sends (see
+---nvim-jdtls/lua/jdtls.lua). This is NOT a `workspace/executeCommand`: jdt.ls
+---never registers a command literally named "java.projectConfiguration.update"
+---- that command-id-shaped string only exists inside VS Code's Java
+---extension, which internally sends this exact same custom method. Routing
+---through client:exec_cmd() with that as the command id gets silently
+---rejected client-side ("Language server `jdtls` does not support command"),
+---which meant this never actually reimported anything - a newly
+---workspace-folder-added module (e.g. an independent/orphan pom) stayed
+---registered as an LSP folder forever but never became a real jdt.ls
+---project (never shows up in `java.project.getAll`), so resolveMainClass/
+---resolveClasspath never saw anything inside it.
 ---@param pom_path string absolute path to the changed pom.xml
 function M.update_project_configuration(pom_path)
   local clients = vim.lsp.get_clients({ name = "jdtls" })
@@ -188,10 +238,32 @@ function M.update_project_configuration(pom_path)
   end
   local uri = vim.uri_from_fname(pom_path)
   for _, client in ipairs(clients) do
-    client:exec_cmd({
-      command = "java.projectConfiguration.update",
-      arguments = { { uri = uri } },
-    }, { bufnr = 0 })
+    client:request("java/projectConfigurationUpdate", { uri = uri }, function(err)
+      if err then
+        vim.notify(
+          "java-debug-model: projectConfigurationUpdate failed for " .. pom_path .. ": " .. tostring(err.message or err),
+          vim.log.levels.WARN)
+      end
+    end, 0)
+  end
+end
+
+---Same as update_project_configuration but batches every given pom.xml into
+---ONE `java/projectConfigurationsUpdate` (plural) notification - what
+---nvim-jdtls's own jdtls.update_projects_config() sends - instead of firing
+---one request per module. Use this for a whole-Project reload
+---(:JavaModelReload) so 8 modules don't mean 8 separate round-trips.
+---@param pom_paths string[] absolute paths to every changed pom.xml
+function M.update_projects_configuration(pom_paths)
+  local clients = vim.lsp.get_clients({ name = "jdtls" })
+  if #clients == 0 then return end
+  local identifiers = {}
+  for _, p in ipairs(pom_paths) do
+    table.insert(identifiers, { uri = vim.uri_from_fname(p) })
+  end
+  if #identifiers == 0 then return end
+  for _, client in ipairs(clients) do
+    client:notify("java/projectConfigurationsUpdate", { identifiers = identifiers })
   end
 end
 

@@ -55,8 +55,14 @@ command("JavaDebugConfigScan", function() jdm().debug_config_scan(current_root()
 
 command("TestNearestMethod", function() jdm().test.run_nearest_method() end, {})
 command("TestClass", function() jdm().test.run_class() end, {})
+command("TestDebugNearestMethod", function() jdm().test.debug_nearest_method() end, {})
+command("TestDebugClass", function() jdm().test.debug_class() end, {})
 
 command("JavaMavenPanel", function()
+  if jdm().maven_panel.is_open() then
+    jdm().maven_panel.close()
+    return
+  end
   jdm().get_project(current_root(), function(project)
     if project then jdm().maven_panel.open(current_root(), project) end
   end)
@@ -76,7 +82,10 @@ command("JavaMavenLifecycle", function()
         { prompt = "Phase:" },
         function(phase)
           if not phase then return end
-          jdm().maven_runner.run(root, vim.fn.fnamemodify(mod.path, ":."), { phase })
+          jdm().maven_runner.run(root, vim.fn.fnamemodify(mod.path, ":."), { phase }, {
+            standalone = not mod.in_reactor,
+            cwd = mod.path,
+          })
         end)
     end)
   end)
@@ -91,7 +100,10 @@ command("JavaMavenGoal", function(args)
       format_item = function(m) return m:ga() end,
     }, function(mod)
       if not mod then return end
-      jdm().maven_runner.run_goal(root, vim.fn.fnamemodify(mod.path, ":."), args.args)
+      jdm().maven_runner.run_goal(root, vim.fn.fnamemodify(mod.path, ":."), args.args, {
+        standalone = not mod.in_reactor,
+        cwd = mod.path,
+      })
     end)
   end)
 end, { nargs = 1 })
@@ -105,6 +117,10 @@ end, { nargs = "+" })
 
 command("JavaSessionPicker", function() jdm().session_picker.pick() end, {})
 command("JavaSessionStatus", function() jdm().session_picker.status() end, {})
+command("JavaSessionStop", function() jdm().session_picker.stop() end, {})
+command("JavaSessionRestart", function() jdm().session_picker.restart() end, {})
+command("JavaSessionRemove", function() jdm().session_picker.remove() end, {})
+command("JavaSessionManage", function() jdm().session_picker.manage() end, {})
 command("JavaTestResults", function() jdm().test_results.open() end, {})
 command("JavaProjectTree", function()
   jdm().get_project(current_root(), function(project)

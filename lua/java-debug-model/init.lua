@@ -2,6 +2,7 @@
 -- Wires model + resolver + watcher + jdtls + dap + maven + ui together.
 local watcher = require("java-debug-model.watcher")
 local jdtls_bridge = require("java-debug-model.jdtls")
+local jdtls_launcher = require("java-debug-model.jdtls_launcher")
 local mainclass = require("java-debug-model.mainclass")
 local config_store = require("java-debug-model.config_store")
 local dap = require("java-debug-model.dap")
@@ -22,6 +23,15 @@ M.opts = {
   active_profiles = {},
   open_j9_java_exec = nil,
   jdtls_bundle_globs = {},
+  -- Extra fields merged (force) on top of jdtls_launcher.build_config()'s own
+  -- config - for overriding/adding to cmd/settings/capabilities/etc. without
+  -- forking jdtls_launcher.lua itself.
+  jdtls_config = nil,
+  -- Path to JavaHello/spring-boot.nvim's language-server dir (application.yml/
+  -- properties completion) - nil = auto-detect the nvim-java cache path this
+  -- config was originally ported from (see bootstrap.lua). Set to false to
+  -- skip spring-boot.nvim wiring entirely.
+  spring_boot_ls_path = nil,
 }
 
 -- The root most recently resolved (from a real file buffer, or from cwd at
@@ -75,7 +85,15 @@ end
 local function find_root(bufnr)
   local bufname = vim.api.nvim_buf_get_name(bufnr or 0)
   local is_own_panel = bufname:match("^java%-debug%-model://") ~= nil
-  if bufname == "" or is_own_panel then
+  -- Buffer KHÔNG phải file thật trên đĩa - vd source jar jdt.ls tự decompile (URI dạng
+  -- "jdt://contents/foo.jar/...=/maven.pomderived=/true=/..." - jdt.ls dùng "=/" làm separator
+  -- riêng, tạo ra chuỗi có HÀNG CHỤC dấu "/" giả, không phải path thật). Đưa thẳng chuỗi này vào
+  -- walk_up_for_reactor_root() (vim.fs.find upward=true) khiến nó đi ngược "từng cấp thư mục" của
+  -- chuỗi dị dạng đó - đã xác nhận qua log (~/tmp/jdm_debug.log): đây chính là nguyên nhân Neovim
+  -- đơ 1-2 phút mỗi lần debug nhảy vào code thư viện (breakpoint dừng, dap tự mở source jar cho
+  -- frame đó). Bất kỳ scheme URI nào ("xxx://...") đều coi như KHÔNG phải file thật, dùng last_root.
+  local is_uri_scheme = bufname:match("^%a[%w+.-]*://") ~= nil
+  if bufname == "" or is_own_panel or is_uri_scheme then
     return last_root or resolve_root_from_cwd() or vim.fn.getcwd()
   end
 
@@ -136,6 +154,26 @@ local function apply_manifest_exclusions(root, project)
   return project
 end
 
+---Ensures jdtls's live workspace folders include every module the resolved
+---Project knows about (reactor-declared AND independent/"orphan" poms found
+---by maven.lua's own recursive filesystem scan) - the Project model is
+---already the single source of truth for "what modules make up this
+---project", so there's no need for a separate hand-rolled scan (e.g. a
+---regex over the root pom.xml's own <modules> plus a ONE-level-deep
+---directory listing) to decide what jdtls should import; this is a strict
+---superset (recursive, and covers modules NOT even a direct child of root).
+---Called automatically every time the model is fetched below, so it stays
+---in sync as new modules are discovered without any separate hook.
+---@param project table
+local function sync_jdtls_workspace(project)
+  local ok, added = pcall(jdtls_bridge.sync_workspace_folders, project)
+  if ok and added and #added > 0 then
+    local names = vim.tbl_map(function(p) return vim.fn.fnamemodify(p, ":t") end, added)
+    vim.notify("java-debug-model: imported into jdtls workspace: " .. table.concat(names, ", "),
+      vim.log.levels.INFO)
+  end
+end
+
 ---Gets (building if needed) the Project model for `root`, applying manifest
 ---exclusions.
 ---@param root string
@@ -150,39 +188,34 @@ end
 function M.get_project(root, callback, profiles)
   if profiles and #profiles > 0 then
     watcher.get_scoped(root, profiles, function(project)
-      if project then project = apply_manifest_exclusions(root, project) end
+      if project then
+        project = apply_manifest_exclusions(root, project)
+        sync_jdtls_workspace(project)
+      end
       callback(project)
-    end)
+    end, build_opts(root))
     return
   end
   watcher.get(root, build_opts(root), function(project)
     if project then
       project = apply_manifest_exclusions(root, project)
       projects_by_root[root] = project
+      sync_jdtls_workspace(project)
     end
     callback(project)
   end)
 end
 
----Registers the jdtls FileType hook. Called from setup(opts.auto_attach) or
----directly by the user's own ftplugin/java.lua.
+---Starts/attaches jdtls for `bufnr` - the WHOLE launch (Mason paths, ASM
+---version pinning, bundles, workspace_dir naming, editor keymaps) lives in
+---jdtls_launcher.lua now; this just wires it to this plugin's own opts.
+---Called from setup(opts.auto_attach) or directly by the user.
 ---@param bufnr integer
 function M.start_or_attach(bufnr)
-  local root = find_root(bufnr)
-  M.get_project(root, function(project)
-    if not project then return end
-    local ok_jdtls, jdtls = pcall(require, "jdtls")
-    if not ok_jdtls then
-      vim.notify("java-debug-model: nvim-jdtls not found", vim.log.levels.ERROR)
-      return
-    end
-    local module = jdtls_bridge.root_dir_for_buffer(project, bufnr) or project.modules[1]
-    local bundles = jdtls_bridge.collect_bundles(M.opts.jdtls_bundle_globs)
-    jdtls.start_or_attach(vim.tbl_deep_extend("force", M.opts.jdtls_config or {}, {
-      root_dir = module and module.path or root,
-      init_options = { bundles = bundles },
-    }))
-  end)
+  jdtls_launcher.start_or_attach(bufnr, {
+    jdtls_config = M.opts.jdtls_config,
+    jdtls_bundle_globs = M.opts.jdtls_bundle_globs,
+  })
 end
 
 ---Forces a full re-resolve for `root`, ignoring cache. The manual "Reload
@@ -193,11 +226,11 @@ function M.reload(root)
     if not project then return end
     project = apply_manifest_exclusions(root, project)
     projects_by_root[root] = project
+    sync_jdtls_workspace(project)
     pcall(project_tree.refresh, project)
     pcall(maven_panel.refresh, project)
-    for _, mod in ipairs(project.modules) do
-      jdtls_bridge.update_project_configuration(mod.path .. "/pom.xml")
-    end
+    local pom_paths = vim.tbl_map(function(mod) return mod.path .. "/pom.xml" end, project.modules)
+    jdtls_bridge.update_projects_configuration(pom_paths)
     vim.notify("java-debug-model: model reloaded (" .. #project.modules .. " modules)", vim.log.levels.INFO)
   end)
 end
@@ -306,18 +339,43 @@ function M.debug_config_from_file(root)
   M.get_project(root, function(project)
     if not project then return end
     local bufnr = vim.api.nvim_get_current_buf()
-    local file = vim.api.nvim_buf_get_name(bufnr)
+    local file = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(bufnr), ":p")
+    -- Module lookup here goes through find_module_for_file (source-root
+    -- prefix match on the buffer's OWN real path) rather than trusting
+    -- mainclass.lua's entry.module - so this still finds the right module
+    -- even if that projectName->artifactId attribution ever mismatches.
+    local module = project:find_module_for_file(file)
+
+    -- jdtls's own resolve_classname() (package regex + filename, NOT a
+    -- "detect main method" scan - it just names the class this file
+    -- declares) gives a match that's independent of mainclass.lua's
+    -- reconstructed file path ever lining up byte-for-byte with the
+    -- buffer's real name (symlinks, relative vs absolute, etc.) - prefer it
+    -- whenever available, falling back to the file-path match otherwise.
+    local ok_util, jdtls_util = pcall(require, "jdtls.util")
+    local current_class = nil
+    if ok_util then
+      local ok_call, result = pcall(jdtls_util.resolve_classname)
+      if ok_call then current_class = result end
+    end
+
     mainclass.find_main_classes(project, function(entries)
       for _, e in ipairs(entries) do
-        if e.file == file then
-          local cfg = config_store.default_from_main_class(e.module, e.main_class)
+        local matches_class = current_class and e.main_class == current_class
+        local matches_file = e.file and vim.fn.fnamemodify(e.file, ":p") == file
+        if matches_class or matches_file then
+          local cfg = config_store.default_from_main_class(e.module or module, e.main_class)
           config_store.add(root, cfg)
           vim.notify("java-debug-model: created debug config '" .. cfg.name .. "' from current file",
             vim.log.levels.INFO)
           return
         end
       end
-      vim.notify("java-debug-model: no main method detected in the current file", vim.log.levels.WARN)
+      vim.notify(
+        string.format(
+          "java-debug-model: no main method detected in the current file (jdtls reported %d main class(es) project-wide)",
+          #entries),
+        vim.log.levels.WARN)
     end)
   end)
 end
@@ -384,6 +442,16 @@ function M.setup(opts)
   M.opts = vim.tbl_deep_extend("force", M.opts, opts or {})
   session.setup_listeners()
 
+  -- Cài Mason packages (jdtls/java-debug-adapter/java-test) + wire spring-boot.nvim nếu có -
+  -- gộp vào đây để "cấu hình java-debug-model" một chỗ là đủ chạy hết tính năng Java, không
+  -- cần người dùng tự lặp lại phần này ở plugins/lsp.lua hay tự viết config spring-boot.nvim
+  -- riêng (xem bootstrap.lua).
+  local bootstrap = require("java-debug-model.bootstrap")
+  bootstrap.ensure_mason_packages()
+  if M.opts.spring_boot_ls_path ~= false then
+    bootstrap.setup_spring_boot({ ls_path = M.opts.spring_boot_ls_path })
+  end
+
   -- Resolve root from cwd immediately - this is cheap directory-walking
   -- only (no `mvn`), so it's fine to run unconditionally even outside a
   -- Maven project. Means :Java* commands know the right project the moment
@@ -401,7 +469,18 @@ function M.setup(opts)
   end
 end
 
-M._find_root = find_root
+---Resolves the workspace/reactor root for `bufnr` (walks up for the
+---outermost ancestor with a pom.xml - see find_root above), falling back to
+---the last resolved root when the buffer isn't a real file in a project.
+---Public so callers outside this plugin (e.g. the user's own
+---ftplugin/java.lua) can point jdtls's own root_dir at the SAME root this
+---plugin resolves the Project model against, instead of running a second,
+---independently-behaving marker search (mvnw/gradlew/.git) that can
+---disagree with it in edge cases.
+---@param bufnr integer?
+---@return string
+M.find_root = find_root
+M._find_root = find_root -- kept for plugin/java-debug-model.lua's internal use
 M.project_tree = project_tree
 M.maven_panel = maven_panel
 M.session_picker = session_picker
@@ -409,5 +488,14 @@ M.test_results = test_results
 M.maven_runner = maven_runner
 M.test = test
 M.config_store = config_store
+
+---Short "⏳ ..." string while a Maven resolve, a Maven Lifecycle run, or a
+---debug launch is in flight, empty otherwise - wire into a statusline
+---component (e.g. lualine_x) to see what's running instead of Neovim
+---appearing frozen during a slow `mvn` call.
+---@return string
+function M.statusline()
+  return require("java-debug-model.status").text()
+end
 
 return M

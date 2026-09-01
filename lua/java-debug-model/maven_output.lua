@@ -7,6 +7,18 @@ local M = {}
 ---logical job reuses its split instead of spawning a new one every time.
 local bufs_by_title = {}
 
+---@type table<string, boolean>  title -> true while that job's terminal is
+---still running, so a statusline component can show what's in flight.
+local running_titles = {}
+
+---@return string[]  titles of every maven_runner job currently in flight
+function M.active_titles()
+  local titles = {}
+  for title in pairs(running_titles) do table.insert(titles, title) end
+  table.sort(titles)
+  return titles
+end
+
 ---@param cmd string[]
 ---@param cwd string
 ---@param opts table?  { title?: string, on_exit?: fun(exit_code: integer) }
@@ -31,9 +43,11 @@ function M.run_in_terminal(cmd, cwd, opts)
   local bufnr = vim.api.nvim_get_current_buf()
   bufs_by_title[title] = bufnr
 
+  running_titles[title] = true
   vim.fn.termopen(cmd, {
     cwd = cwd,
     on_exit = function(_, exit_code)
+      running_titles[title] = nil
       if opts.on_exit then opts.on_exit(exit_code) end
       if exit_code == 0 then
         vim.notify("java-debug-model: " .. title .. " finished OK", vim.log.levels.INFO)

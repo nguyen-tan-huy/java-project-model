@@ -20,11 +20,50 @@ local function supports_command(client, command)
   return vim.list_contains(commands, command)
 end
 
+---Converts a fully-qualified class name to the relative .java path it lives
+---at under a source root, following the standard Java package-to-directory
+---convention - e.g. "com.foo.Bar" -> "com/foo/Bar.java". A nested/inner
+---class ("com.foo.Outer$Inner") lives in the OUTER class's file, so only the
+---part before the first "$" is used.
+---@param fqcn string
+---@return string
+local function fqcn_to_relpath(fqcn)
+  local top_level = fqcn:match("^([^$]+)") or fqcn
+  return (top_level:gsub("%.", "/")) .. ".java"
+end
+
+---Locates the actual .java file for a resolved main class, by checking each
+---of the module's own main source roots for the FQCN's conventional path.
+---@param module table|nil Module
+---@param main_class string
+---@return string|nil
+local function resolve_file_for_entry(module, main_class)
+  if not module then return nil end
+  local rel = fqcn_to_relpath(main_class)
+  for _, sr in ipairs(module:main_source_roots()) do
+    local candidate = sr.path .. "/" .. rel
+    if vim.fn.filereadable(candidate) == 1 then
+      return candidate
+    end
+  end
+  return nil
+end
+
 ---Finds every `main(String[])` entry point across the whole project via the
 ---java-debug bundle's `vscode.java.resolveMainClass` executeCommand -
 ---AST-backed, whole-workspace, no per-file text scanning needed.
+---
+---The response items only ever carry `mainClass` and `projectName` (verified
+---against nvim-jdtls's own jdtls/dap.lua, which never reads anything else off
+---them either) - there is NO `filePath` field, despite that being a
+---plausible-looking name. `file`/`module` are instead derived here: jdtls
+---(m2e) sets `projectName` to the Eclipse project name, which for an
+---imported Maven module is its artifactId - the same identity
+---Project:find_module_by_artifact_id() already matches classpath jars
+---against elsewhere in this plugin - and from there the FQCN maps
+---deterministically to a path under that module's own main source roots.
 ---@param project table Project (used to attach a Module to each result)
----@param callback fun(entries: {main_class:string, project_name:string, file:string, module:table|nil}[])
+---@param callback fun(entries: {main_class:string, project_name:string, file:string|nil, module:table|nil}[])
 function M.find_main_classes(project, callback)
   local client = jdtls_clients()[1]
   if not client then callback({}) return end
@@ -36,12 +75,12 @@ function M.find_main_classes(project, callback)
     end
     local entries = {}
     for _, item in ipairs(result) do
-      local file = item.filePath
+      local module = item.projectName and project:find_module_by_artifact_id(item.projectName) or nil
       table.insert(entries, {
         main_class = item.mainClass,
         project_name = item.projectName,
-        file = file,
-        module = file and project:find_module_for_file(file) or nil,
+        file = resolve_file_for_entry(module, item.mainClass),
+        module = module,
       })
     end
     callback(entries)
