@@ -50,4 +50,64 @@ function M.setup_spring_boot(opts)
   spring_boot.init_lsp_commands()
 end
 
+---Fetches+extracts a prebuilt, ALREADY-PATCHED jdtls distribution from a GitHub Release asset
+---(a .tar.gz built via the full `./mvnw clean verify` in eclipse.jdt.ls-build, see that repo's
+---local-patches branch) if `dest` doesn't already look populated - lets a machine that never ran
+---the Tycho build (which needs JDK 21 + a large p2 target-platform download, tens of minutes) get
+---the SAME patched jdtls jdtls_launcher.lua expects, with zero build step. This is NOT a Mason
+---registry package (writing/hosting a real mason-registry entry is a lot of machinery for a
+---single personal patched build) - just a plain HTTP download + tar extraction, run ONCE, the
+---same way Mason's own installers ultimately GET their packages.
+---
+---Deliberately BLOCKING (vim.fn.system, not vim.system+callback): this only ever runs the very
+---FIRST time on a fresh machine (every later startup, the dest-populated check below skips it in
+---a single stat call) - a one-time 10-60s wait during that first startup is a better trade-off
+---than a background download racing the very first jdtls launch this Neovim session might trigger.
+---@param opts table  { url: string  (release asset .tar.gz URL - REQUIRED, no default: depends on
+---                      which fork/release the caller published), dest?: string  (defaults to the
+---                      path jdtls_launcher.lua looks up first, see its own jdtls_path comment) }
+function M.ensure_jdtls_prebuilt(opts)
+  opts = opts or {}
+  if not opts.url or opts.url == "" then return end
+  local dest = opts.dest or (vim.fn.stdpath("data") .. "/nvim-java/packages/jdtls/1.54.0")
+
+  -- "Populated" = has its own launcher script, not just an empty/partial dir from a previously
+  -- interrupted download - re-attempts on next startup if a prior download got cut off partway.
+  if vim.fn.filereadable(dest .. "/bin/jdtls") == 1 then return end
+
+  if vim.fn.executable("curl") == 0 or vim.fn.executable("tar") == 0 then
+    vim.notify("java-debug-model: cần 'curl' và 'tar' để tự tải jdtls đã patch sẵn - không thấy trong PATH.",
+      vim.log.levels.WARN)
+    return
+  end
+
+  vim.notify("java-debug-model: chưa có jdtls đã patch tại " .. dest .. " - đang tải từ " .. opts.url ..
+    " (lần đầu, có thể mất 10-60s tuỳ mạng)...", vim.log.levels.INFO)
+
+  local tmp = vim.fn.tempname() .. ".tar.gz"
+  local download = vim.fn.system({ "curl", "-fsSL", opts.url, "-o", tmp })
+  if vim.v.shell_error ~= 0 then
+    pcall(vim.fn.delete, tmp)
+    vim.notify("java-debug-model: tải jdtls thất bại - " .. vim.trim(download), vim.log.levels.ERROR)
+    return
+  end
+
+  vim.fn.mkdir(dest, "p")
+  local extract = vim.fn.system({ "tar", "xzf", tmp, "-C", dest })
+  pcall(vim.fn.delete, tmp)
+  if vim.v.shell_error ~= 0 then
+    vim.notify("java-debug-model: giải nén jdtls thất bại - " .. vim.trim(extract), vim.log.levels.ERROR)
+    return
+  end
+
+  if vim.fn.filereadable(dest .. "/bin/jdtls") == 1 then
+    vim.notify("java-debug-model: đã tải+giải nén jdtls (đã patch) vào " .. dest, vim.log.levels.INFO)
+  else
+    vim.notify(
+      "java-debug-model: đã giải nén nhưng không thấy bin/jdtls tại " .. dest ..
+      " - kiểm tra lại URL/cấu trúc file tar.gz (asset có nên có thư mục con bọc ngoài không?).",
+      vim.log.levels.WARN)
+  end
+end
+
 return M

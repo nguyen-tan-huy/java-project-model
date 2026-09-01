@@ -113,6 +113,48 @@ function M._run_maven(root, args, opts, callback)
   end)
 end
 
+---Runs `mvn dependency:tree` for ONE module and returns its raw text output - the classic
+---indented ASCII tree WITH Maven's own conflict-resolution reasoning inline (e.g.
+---"(commons-io:commons-io:jar:2.6:compile - omitted for conflict with 2.11.0)"). This is
+---deliberately NOT derived from anything already in the Project model: jdtls.lua's
+---resolve_classpath works off module._classpath_jars, a FLAT list Maven has already mediated
+---down to one version per artifact - by the time a jar lands in that list, the "who else asked
+---for a different version, and why did THIS one win" information is gone. That's exactly the
+---question a dependency-conflict bug needs answered (mirrors IntelliJ's own Dependency Tree/
+---Diagram view), so this re-invokes Maven itself for the full unflattened tree instead.
+----Dverbose keeps EVERY conflicting/duplicate entry visible (not just the winner) - the whole
+---point of consulting this view over the resolved classpath in the first place.
+---
+---Writes to a temp file via -DoutputFile instead of reading stdout: mvn prefixes EVERY line of
+---plugin output with its own "[INFO] " log marker on stdout (confirmed for real against
+---product-service - a search for "product-core" only matched the ONE already-indented line
+---itself with no ancestor chain above it, because ui/dependency_tree.lua's depth computation
+---reads a line's indentation from byte 1 and "[INFO] " isn't "|  "/"   "/"+- "/"\- ", so EVERY
+---line looked like a depth-0 root to it). -DoutputFile is the dependency-tree goal's own
+---documented way to get the tree WITHOUT any log wrapping - the same "avoid parsing mvn's log
+---output" approach M._resolve_classpaths below already uses via -Dmdep.outputFile for
+---dependency:build-classpath (note: the tree goal's own property is "outputFile", NOT
+---"mdep.outputFile" - the two goals expose it under different property names).
+---@param module_path string
+---@param opts table?  { profiles?: string[], verbose?: boolean }  verbose defaults to true
+---@param callback fun(ok: boolean, lines: string[]|nil, err: string|nil)
+function M.dependency_tree(module_path, opts, callback)
+  opts = opts or {}
+  local outfile = vim.fn.tempname()
+  local args = { "dependency:tree", "-DoutputFile=" .. outfile }
+  if opts.verbose ~= false then table.insert(args, "-Dverbose") end
+  M._run_maven(module_path, args, { profiles = opts.profiles }, function(ok, _, stderr)
+    if not ok or vim.fn.filereadable(outfile) == 0 then
+      pcall(vim.fn.delete, outfile)
+      callback(false, nil, (stderr ~= "" and stderr) or "mvn dependency:tree failed")
+      return
+    end
+    local lines = vim.fn.readfile(outfile)
+    pcall(vim.fn.delete, outfile)
+    callback(true, lines, nil)
+  end)
+end
+
 local function xml_unescape(s)
   return (s:gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&amp;", "&"):gsub("&quot;", '"'):gsub("&apos;", "'"))
 end

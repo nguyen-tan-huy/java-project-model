@@ -91,6 +91,14 @@ command("JavaMavenLifecycle", function()
   end)
 end, {})
 
+command("JavaDependencyTree", function()
+  if jdm().dependency_tree_ui.is_open() then
+    jdm().dependency_tree_ui.close()
+    return
+  end
+  jdm().dependency_tree(current_root())
+end, {})
+
 command("JavaMavenGoal", function(args)
   local root = current_root()
   jdm().get_project(root, function(project)
@@ -121,6 +129,13 @@ command("JavaSessionStop", function() jdm().session_picker.stop() end, {})
 command("JavaSessionRestart", function() jdm().session_picker.restart() end, {})
 command("JavaSessionRemove", function() jdm().session_picker.remove() end, {})
 command("JavaSessionManage", function() jdm().session_picker.manage() end, {})
+command("JavaSessionUI", function()
+  if jdm().session_manager_ui.is_open() then
+    jdm().session_manager_ui.close()
+    return
+  end
+  jdm().session_manager_ui.open()
+end, {})
 command("JavaTestResults", function() jdm().test_results.open() end, {})
 command("JavaProjectTree", function()
   jdm().get_project(current_root(), function(project)

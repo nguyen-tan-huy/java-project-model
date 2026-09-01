@@ -15,6 +15,8 @@ local maven_panel = require("java-debug-model.ui.maven_panel")
 local session_picker = require("java-debug-model.ui.session_picker")
 local test_results = require("java-debug-model.ui.test_results")
 local config_form = require("java-debug-model.ui.config_form")
+local dependency_tree_ui = require("java-debug-model.ui.dependency_tree")
+local session_manager_ui = require("java-debug-model.ui.session_manager")
 
 local M = {}
 
@@ -32,6 +34,18 @@ M.opts = {
   -- config was originally ported from (see bootstrap.lua). Set to false to
   -- skip spring-boot.nvim wiring entirely.
   spring_boot_ls_path = nil,
+  -- URL of a prebuilt, already-patched jdtls .tar.gz GitHub Release asset (see
+  -- eclipse.jdt.ls-build's local-patches branch + bootstrap.lua's
+  -- ensure_jdtls_prebuilt) - nil (default) skips this entirely, meaning a
+  -- machine missing jdtls_prebuilt_dest falls straight through to
+  -- jdtls_launcher.lua's own Mason fallback (a DIFFERENT, unpatched jdtls
+  -- version) instead. Set this once you've published a release so a fresh
+  -- machine gets the patched build with no local Tycho build ever required.
+  jdtls_prebuilt_url = nil,
+  -- Where to extract that release asset into - defaults to the exact path
+  -- jdtls_launcher.lua's build_config looks up FIRST (see its own jdtls_path
+  -- comment), so this needs no other wiring once set.
+  jdtls_prebuilt_dest = nil,
 }
 
 -- The root most recently resolved (from a real file buffer, or from cwd at
@@ -404,6 +418,26 @@ function M.debug_config_scan(root)
   end)
 end
 
+---Opens the Dependency Tree panel (`mvn dependency:tree -Dverbose`, with version-conflict lines
+---highlighted) for a module the user picks - the "why is the wrong version of this jar on my
+---classpath" debugging tool, same idea as IntelliJ's Dependency Tree/Diagram view. Uses
+---M.opts.active_profiles (same profile set the rest of the plugin resolves against), NOT a
+---per-config profile list - there's no DebugConfig involved here, just "this module, current
+---profiles".
+---@param root string
+function M.dependency_tree(root)
+  M.get_project(root, function(project)
+    if not project then return end
+    vim.ui.select(project.modules, {
+      prompt = "Module: xem dependency tree",
+      format_item = function(m) return m:ga() end,
+    }, function(mod)
+      if not mod then return end
+      dependency_tree_ui.open(mod, { profiles = M.opts.active_profiles })
+    end)
+  end)
+end
+
 function M.debug_config_run(root, name)
   local cfg = config_store.get(root, name)
   if not cfg then
@@ -447,6 +481,10 @@ function M.setup(opts)
   -- cần người dùng tự lặp lại phần này ở plugins/lsp.lua hay tự viết config spring-boot.nvim
   -- riêng (xem bootstrap.lua).
   local bootstrap = require("java-debug-model.bootstrap")
+  -- Chạy TRƯỚC ensure_mason_packages: nếu tải/giải nén thành công, dest đã có sẵn trước khi
+  -- jdtls_launcher.lua's build_config tìm tới nó, nên không bao giờ rơi vào nhánh fallback
+  -- Mason (jdtls_prebuilt_url = nil mặc định thì hàm này no-op ngay dòng đầu).
+  bootstrap.ensure_jdtls_prebuilt({ url = M.opts.jdtls_prebuilt_url, dest = M.opts.jdtls_prebuilt_dest })
   bootstrap.ensure_mason_packages()
   if M.opts.spring_boot_ls_path ~= false then
     bootstrap.setup_spring_boot({ ls_path = M.opts.spring_boot_ls_path })
@@ -488,6 +526,8 @@ M.test_results = test_results
 M.maven_runner = maven_runner
 M.test = test
 M.config_store = config_store
+M.dependency_tree_ui = dependency_tree_ui
+M.session_manager_ui = session_manager_ui
 
 ---Short "⏳ ..." string while a Maven resolve, a Maven Lifecycle run, or a
 ---debug launch is in flight, empty otherwise - wire into a statusline
