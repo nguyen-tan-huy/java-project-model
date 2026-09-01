@@ -47,7 +47,7 @@ are Maven's job, never a hand-rolled parser's.
 
 ```lua
 {
-  "yourname/java-debug-model",
+  "nguyen-tan-huy/java-debug-model",
   dependencies = {
     "mfussenegger/nvim-jdtls",
     "mfussenegger/nvim-dap",
