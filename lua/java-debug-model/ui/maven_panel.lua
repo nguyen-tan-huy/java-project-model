@@ -11,6 +11,7 @@
 -- A "Skip Tests" toggle (T) shown in the header, applying -DskipTests to
 -- subsequent runs via maven_runner.skip_tests.
 local maven_runner = require("java-debug-model.maven_runner")
+local maven_jdk = require("java-debug-model.maven_jdk")
 local panel_registry = require("java-debug-model.ui.panel_registry")
 
 local M = {}
@@ -112,10 +113,19 @@ local function build_tree(project)
   return top
 end
 
+local function jdk_label()
+  local path = maven_jdk.get(state.root)
+  if not path then return "mặc định" end
+  local ok_jdk, jdk = pcall(require, "jdk")
+  if ok_jdk then return jdk.ee_name(jdk.major_version(path)) end
+  return path
+end
+
 local function header_lines()
   return {
-    "Maven Projects" .. (maven_runner.skip_tests and "  [Skip Tests: ON]" or "  [Skip Tests: OFF]"),
-    "(<CR>: chạy phase / mở-đóng node, T: bật-tắt skip tests, R: refresh, q: đóng)",
+    "Maven Projects" .. (maven_runner.skip_tests and "  [Skip Tests: ON]" or "  [Skip Tests: OFF]")
+      .. "  [JDK: " .. jdk_label() .. "]",
+    "(<CR>: chạy phase / mở-đóng node, T: bật-tắt skip tests, J: chọn JDK, R: refresh, q: đóng)",
     "",
   }
 end
@@ -210,6 +220,10 @@ local function toggle_skip_tests()
   render()
 end
 
+local function select_jdk()
+  maven_jdk.select(state.root, render)
+end
+
 ---Opens (or focuses, if already open) the persistent Maven Lifecycle panel
 ---for `root`'s current Project model.
 ---@param root string
@@ -233,6 +247,7 @@ function M.open(root, project)
     vim.api.nvim_buf_set_name(state.bufnr, "java-debug-model://maven-panel")
     vim.keymap.set("n", "<CR>", run_at_cursor, { buffer = state.bufnr, nowait = true })
     vim.keymap.set("n", "T", toggle_skip_tests, { buffer = state.bufnr, nowait = true })
+    vim.keymap.set("n", "J", select_jdk, { buffer = state.bufnr, nowait = true, desc = "Chọn JDK cho Maven (persist)" })
     vim.keymap.set("n", "R", function() M.refresh() end, { buffer = state.bufnr, nowait = true })
     vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = state.bufnr, nowait = true })
   end

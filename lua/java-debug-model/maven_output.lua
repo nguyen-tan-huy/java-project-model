@@ -21,7 +21,7 @@ end
 
 ---@param cmd string[]
 ---@param cwd string
----@param opts table?  { title?: string, on_exit?: fun(exit_code: integer) }
+---@param opts table?  { title?: string, on_exit?: fun(exit_code: integer), env?: table<string, string> }
 function M.run_in_terminal(cmd, cwd, opts)
   opts = opts or {}
   local title = opts.title or table.concat(cmd, " ")
@@ -46,6 +46,7 @@ function M.run_in_terminal(cmd, cwd, opts)
   running_titles[title] = true
   vim.fn.termopen(cmd, {
     cwd = cwd,
+    env = opts.env, -- e.g. JAVA_HOME/PATH override from maven_jdk.lua's persisted selection
     on_exit = function(_, exit_code)
       running_titles[title] = nil
       if opts.on_exit then opts.on_exit(exit_code) end

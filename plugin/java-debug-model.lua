@@ -68,6 +68,13 @@ command("JavaMavenPanel", function()
   end)
 end, {})
 
+command("JavaMavenSelectJdk", function()
+  local root = current_root()
+  jdm().maven_jdk.select(root, function()
+    if jdm().maven_panel.is_open() then jdm().maven_panel.refresh() end
+  end)
+end, {})
+
 command("JavaMavenLifecycle", function()
   local root = current_root()
   jdm().get_project(root, function(project)

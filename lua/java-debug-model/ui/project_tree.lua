@@ -117,18 +117,15 @@ local function ensure_children(node)
   if node.children ~= nil then return end
   if node.kind == "module" then
     local mod = node.data
-    node.children = {}
-    for _, sr in ipairs(mod.source_roots) do
-      table.insert(node.children, {
-        kind = "source_root",
-        sr_kind = sr.kind, -- "main"|"test", used to pick the icon highlight
-        label = string.format("[%s] %s", sr.kind, vim.fn.fnamemodify(sr.path, ":t")),
-        path = sr.path,
-        depth = node.depth + 1,
-        expanded = false,
-        children = nil,
-      })
-    end
+    -- The module's OWN real directory contents - resolver/maven.lua's source_roots only ever
+    -- covers src/main/java and src/test/java (never src/main/resources, src/main/webapp, or
+    -- anything else Maven-conventional-but-not-Java), so listing JUST those as a special
+    -- "[main]/[test] java" shortcut used to mean resources/webapp/config files/pom.xml never
+    -- showed up in the tree at all. Showing the real "src" folder (via the same
+    -- scandir_children() every other "dir" node already lazily expands through) already
+    -- contains src/main/java itself one level down - a separate shortcut entry pointing at the
+    -- exact same directory was pure duplication, not "showing more".
+    node.children = scandir_children(mod.path, node.depth + 1, node)
     table.insert(node.children, {
       kind = "deps",
       label = "Dependencies",
@@ -162,15 +159,41 @@ end
 
 local ICONS = { project = "", module = "󰏗", deps = "", source_root = "", dir = "", file = "" }
 
+---Per-extension icon+highlight for a REAL file node (node.path set - excludes the "deps" list's
+---own kind="file" entries, which are dependency descriptors like "org.slf4j:slf4j-api:jar:...",
+---not filenames, and have no .path at all) via nvim-tree/nvim-web-devicons, if installed.
+---Optional - NOT a hard dependency of this plugin (not listed in plugins/java.lua's own
+---`dependencies`, matching how the rest of this nvim config already treats it as "not strictly
+---required, but recommended" for other tree-style UIs) - falls back to the generic ICONS.file
+---glyph below when devicons isn't installed, so java-debug-model stays fully usable without it.
+---Re-pcall'd on every call rather than cached at module load: this module can get required
+---(triggering that cache) before lazy.nvim has loaded devicons at all, which would wrongly pin
+---"unavailable" for the rest of the session - render() only runs on user-driven tree
+---open/expand/refresh, never per-keystroke, so the repeated pcall cost is a non-issue.
 ---@param node TreeNode
+---@return string|nil icon, string|nil hl_group
+local function devicon_for(node)
+  if not (node.kind == "file" and node.path) then return nil end
+  local ok, devicons = pcall(require, "nvim-web-devicons")
+  if not ok then return nil end
+  local name = vim.fn.fnamemodify(node.path, ":t")
+  local icon, hl = devicons.get_icon(name, name:match("%.([^.]+)$"), { default = true })
+  return icon, hl
+end
+
+---@param node TreeNode
+---@param devicon_hl string|nil  2nd return of devicon_for(node), passed in so callers that
+---already computed it (walk() below, for the icon glyph itself) don't pay for a 2nd devicons
+---lookup just to also get its highlight group here.
 ---@return string hl_group  icon highlight for this node
-local function icon_hl(node)
+local function icon_hl(node, devicon_hl)
   if node.kind == "source_root" and node.sr_kind == "test" then
     return "JavaTreeSourceRootTestIcon"
   end
   if node.kind == "file" and node.is_sibling then
     return "JavaTreeSiblingIcon"
   end
+  if devicon_hl then return devicon_hl end
   return ({
     project = "JavaTreeProjectIcon",
     module = "JavaTreeModuleIcon",
@@ -207,7 +230,8 @@ local function render()
       marker = "  "
     end
 
-    local icon = ICONS[node.kind] or ""
+    local devicon, devicon_hl = devicon_for(node)
+    local icon = devicon or ICONS[node.kind] or ""
     local head = prefix .. connector
     local line = head .. marker .. icon .. " " .. node.label
     table.insert(lines, line)
@@ -220,7 +244,7 @@ local function render()
     end
     table.insert(highlights, { row, #head, #head + #marker, "JavaTreeMarker" })
     local icon_start = #head + #marker
-    table.insert(highlights, { row, icon_start, icon_start + #icon, icon_hl(node) })
+    table.insert(highlights, { row, icon_start, icon_start + #icon, icon_hl(node, devicon_hl) })
 
     -- Làm mờ phần tag cuối nhãn - "[independent pom]", "[compile]", "(sibling module)"...
     local label_start = icon_start + #icon + 1

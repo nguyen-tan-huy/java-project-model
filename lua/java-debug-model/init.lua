@@ -8,6 +8,7 @@ local config_store = require("java-debug-model.config_store")
 local dap = require("java-debug-model.dap")
 local session = require("java-debug-model.session")
 local maven_runner = require("java-debug-model.maven_runner")
+local maven_jdk = require("java-debug-model.maven_jdk")
 local test = require("java-debug-model.test")
 
 local project_tree = require("java-debug-model.ui.project_tree")
@@ -586,6 +587,7 @@ M.maven_panel = maven_panel
 M.session_picker = session_picker
 M.test_results = test_results
 M.maven_runner = maven_runner
+M.maven_jdk = maven_jdk
 M.test = test
 M.config_store = config_store
 M.dependency_tree_ui = dependency_tree_ui

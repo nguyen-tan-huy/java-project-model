@@ -4,6 +4,7 @@
 -- never forces a project-model reload by itself (the watcher already reacts
 -- if a pom.xml happens to change as a result).
 local output = require("java-debug-model.maven_output")
+local maven_jdk = require("java-debug-model.maven_jdk")
 
 local M = {}
 
@@ -81,6 +82,9 @@ function M.run(root, module_rel_path, goals, opts)
   local scope_label = opts.whole_reactor and "whole reactor" or module_rel_path
   output.run_in_terminal(cmd, cwd, {
     title = string.format("mvn %s (%s)", table.concat(goals, " "), scope_label),
+    -- Persisted per-root JDK selection (maven_jdk.lua) - nil when none was ever picked, in which
+    -- case termopen inherits Neovim's own JAVA_HOME/PATH unchanged, exactly as before.
+    env = maven_jdk.env_for(root),
   })
 end
 

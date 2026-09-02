@@ -7,6 +7,10 @@ local M = {}
 ---@class SessionEntry
 ---@field id integer
 ---@field name string
+---@field kind "debug"|"test"    -- "test" = an ephemeral JUnit run (test.lua) - not backed by a
+---saved config_store DebugConfig, so ui/session_manager.lua shows it as a TEMPORARY profile row
+---(like IntelliJ's own auto-generated temporary Run Configurations for a test run) and M.restart
+---doesn't apply to it the same way (see M.restart's own guard).
 ---@field root string           -- project root this session's DebugConfig lives under (config_store key) - needed by M.restart to re-run debug_config_run(root, name)
 ---@field module_path string
 ---@field profiles string[]
@@ -16,6 +20,12 @@ local M = {}
 ---@type SessionEntry[]
 local sessions = {}
 local next_id = 1
+
+---@type table<table, integer>  raw nvim-dap Session object -> bufnr, WEAK on the key so a session
+---that never gets linked (see comment on setup_output_capture below) doesn't pin it in memory
+---forever. Holds output captured for a dap Session BEFORE M.mark_started has linked it to one of
+---our own SessionEntry rows.
+local pending_output_bufs = setmetatable({}, { __mode = "k" })
 
 ---@param id integer
 ---@return string  a fixed, unique-per-session marker string - dap.lua's M.launch injects this as
@@ -129,6 +139,7 @@ function M.register(fields)
   table.insert(sessions, {
     id = id,
     name = fields.name,
+    kind = fields.kind or "debug",
     root = fields.root,
     module_path = fields.module_path,
     profiles = fields.profiles or {},
@@ -145,6 +156,17 @@ function M.mark_started(id, dap_session)
     if entry.id == id then
       entry.status = "running"
       entry.dap_session = dap_session
+      -- Reclaim any output setup_output_capture already buffered for this RAW dap_session before
+      -- this link existed (see that function's own comment - test.lua's M.rerun/invoke() only
+      -- calls this AFTER polling dap.session() into existence, well after the debuggee JVM was
+      -- actually launched, so early OutputEvents - e.g. a @SpringBootTest's whole context-startup
+      -- log - would otherwise be silently dropped instead of ending up in this entry's own log).
+      local pending = pending_output_bufs[dap_session]
+      if pending and vim.api.nvim_buf_is_valid(pending) then
+        local ok_status, dap_status = pcall(require, "dap_status")
+        if ok_status then dap_status.term_bufs[entry.name] = pending end
+        pending_output_bufs[dap_session] = nil
+      end
       return
     end
   end
@@ -239,6 +261,12 @@ function M.restart(id)
     end
   end
   if not entry then return end
+  if entry.kind == "test" then
+    vim.notify(
+      "java-debug-model: '" .. entry.name .. "' là 1 lần chạy test tạm (không có config lưu sẵn) - " ..
+      "dùng lại <leader>jtm/<leader>jtc tại đúng test đó để chạy lại.", vim.log.levels.WARN)
+    return
+  end
   if not entry.root then
     vim.notify("java-debug-model: session '" .. entry.name .. "' has no known root - cannot restart.",
       vim.log.levels.WARN)
@@ -340,16 +368,35 @@ local function setup_output_capture(dap)
         break
       end
     end
-    if not entry then return end -- not one of OUR tracked sessions (e.g. a Rust/codelldb session) - leave it alone
 
     local ok_status, dap_status = pcall(require, "dap_status")
     if not ok_status then return end
 
-    local buf = dap_status.term_bufs[entry.name]
+    local buf
+    if entry then
+      buf = dap_status.term_bufs[entry.name]
+    else
+      -- Not yet linked to a tracked SessionEntry - either a session.lua never registered at all
+      -- (e.g. a Rust/codelldb session; harmless, this pending buffer just sits unclaimed and gets
+      -- garbage-collected once nvim-dap drops the Session object, since pending_output_bufs keys
+      -- weakly) or test.lua's M.rerun/invoke() only calls
+      -- M.mark_started AFTER polling dap.session() into existence (jdtls's test runner never
+      -- returns the Session object directly - see its own comment), well after the debuggee JVM
+      -- was actually launched. A slow-starting debuggee (e.g. a @SpringBootTest booting a full
+      -- ApplicationContext) can easily emit its entire startup log in that gap - buffer it under
+      -- the RAW dap_session object itself so M.mark_started can reclaim it once linked, instead of
+      -- silently dropping it (leaving ui/session_manager.lua's log pane falling back to the shared
+      -- REPL, which never had this output either).
+      buf = pending_output_bufs[dap_session]
+    end
     if not (buf and vim.api.nvim_buf_is_valid(buf)) then
       buf = vim.api.nvim_create_buf(false, true)
       vim.bo[buf].bufhidden = "hide"
-      dap_status.term_bufs[entry.name] = buf
+      if entry then
+        dap_status.term_bufs[entry.name] = buf
+      else
+        pending_output_bufs[dap_session] = buf
+      end
     end
 
     -- Append body.output the same way nvim-dap's own REPL does: text may contain embedded

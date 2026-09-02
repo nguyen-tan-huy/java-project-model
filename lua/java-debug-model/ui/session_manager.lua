@@ -4,6 +4,12 @@
 -- per profile - not a transient log of session instances. Selecting a profile shows its live
 -- console on the right if it's running; running/restarting/stopping acts on the profile under the
 -- cursor directly, no extra "which one?" picker needed since the picker IS the list itself.
+--
+-- ALSO lists every ephemeral TEST run (test.lua registers these into session.lua with
+-- kind="test") as its own row, the same way IntelliJ auto-generates a TEMPORARY Run
+-- Configuration the moment you run a single test - these aren't backed by a config_store
+-- DebugConfig at all (nothing to "edit" or "restart" the normal way, see the kind=="test" guards
+-- throughout below), they just ride along in the same list/log-pane UI as the saved profiles.
 local session = require("java-debug-model.session")
 local panel_registry = require("java-debug-model.ui.panel_registry")
 
@@ -29,8 +35,14 @@ local STATUS_ICON = {
 }
 local NOT_STARTED_ICON = "○"
 
----@return table|nil DebugConfig
-local function config_at_cursor()
+---@class Row
+---@field kind "config"|"test"
+---@field config table|nil   DebugConfig - set when kind=="config"
+---@field entry table|nil    session.SessionEntry - set when kind=="test" (the entry itself IS
+---the row; a "test" row has no separate saved config to look one up from)
+
+---@return Row|nil
+local function row_at_cursor()
   if not (state.winid and vim.api.nvim_win_is_valid(state.winid)) then return nil end
   local lnum = vim.api.nvim_win_get_cursor(state.winid)[1]
   return state.line_map[lnum]
@@ -44,24 +56,70 @@ end
 local function session_for(name)
   local found
   for _, e in ipairs(session.list()) do
-    if e.name == name then found = e end
+    if e.kind ~= "test" and e.name == name then found = e end
   end
   return found
 end
 
----Buffer showing session `name`'s console output - the SAME per-session terminal buffer
+---Resolves a Row to its underlying session.SessionEntry (if any) regardless of kind - a "config"
+---row looks one up by name (session_for), a "test" row already IS the entry.
+---@param row Row|nil
+---@return table|nil session.SessionEntry
+local function row_session(row)
+  if not row then return nil end
+  if row.kind == "test" then return row.entry end
+  return session_for(row.config.name)
+end
+
+---@param row Row|nil
+---@return string
+local function row_name(row)
+  if not row then return "?" end
+  return row.kind == "test" and row.entry.name or row.config.name
+end
+
+---dap_status.term_bufs/ports are keyed by whatever string the ACTUAL launch used as its DAP
+---config `.name` - for a "config" row that's always entry.name (java-debug-model's own dap.lua
+---sets config.name = the DebugConfig's name), but for a "test" row (test.lua) it's the java-test
+---bundle's own `lens.fullName` (a fully-qualified "pkg.Class#method()" string jdtls.dap generates
+---internally - see its own make_config) - DIFFERENT from the friendly entry.name
+---session.lua/ui/session_manager.lua track ("Foo (nearest test)"). Confirmed for real: a test
+---run's actual output landed in dap_status.term_bufs["net.lvs...Foo#test()"], NOT
+---dap_status.term_bufs[entry.name], so looking up only entry.name silently found nothing and fell
+---all the way back to the placeholder/shared REPL even though real output existed all along. Once
+---the session has actually started, entry.dap_session.config.name is that real key - prefer it.
+---@param entry SessionEntry
+---@return string
+local function dap_status_key_for(entry)
+  if entry.dap_session and entry.dap_session.config and entry.dap_session.config.name then
+    return entry.dap_session.config.name
+  end
+  return entry.name
+end
+
+---Buffer showing session `entry`'s console output - the SAME per-session terminal buffer
 ---plugins/dap.lua's terminal_win_cmd creates (shared via dap_status.term_bufs, see its own
 ---comment for why: java-debug-model doesn't own console capture itself, the user's dap.lua
----config does, for every dap session regardless of launch path). Falls back to the shared DAP
----REPL buffer for adapters that send output via OutputEvent instead of a real terminal (jdtls's
----own java-debug adapter does this - term_bufs never gets populated for it).
----@param name string
+---config does, for every dap session regardless of launch path) OR session.lua's own OutputEvent
+---capture (for adapters/launches that stream via OutputEvent instead of runInTerminal - which key
+---it actually landed under depends on the launch, see dap_status_key_for above). Falls back to
+---the shared DAP REPL buffer if neither produced anything (yet).
+---@param entry SessionEntry
 ---@return integer|nil bufnr
-local function log_buf_for(name)
+local function log_buf_for(entry)
   local ok_status, dap_status = pcall(require, "dap_status")
-  local buf = ok_status and dap_status.term_bufs[name]
-  if buf and vim.api.nvim_buf_is_valid(buf) then
-    return buf
+  if ok_status then
+    local buf = dap_status.term_bufs[dap_status_key_for(entry)]
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      return buf
+    end
+    -- entry.name and the real launch-config name can differ (see dap_status_key_for) - try both,
+    -- in case the OutputEvent path (keyed by entry.name) captured something while the
+    -- runInTerminal path (keyed by the launch config's own name) didn't, or vice versa.
+    buf = dap_status.term_bufs[entry.name]
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      return buf
+    end
   end
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
     if vim.bo[b].buftype == "prompt" and vim.api.nvim_buf_get_name(b):match("dap%-repl%-%d+") then
@@ -87,15 +145,16 @@ end
 ---for the first time - "starting" -> "running" - well after the panel itself was already open).
 local function sync_log_to_cursor()
   if not (state.log_winid and vim.api.nvim_win_is_valid(state.log_winid)) then return end
-  local cfg = config_at_cursor()
-  local entry = cfg and session_for(cfg.name)
-  local buf = entry and log_buf_for(entry.name)
+  local row = row_at_cursor()
+  local entry = row_session(row)
+  local buf = entry and log_buf_for(entry)
   if not buf then
     buf = ensure_placeholder_buf()
     vim.bo[buf].modifiable = true
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
       "", "",
-      "  " .. (cfg and ("'" .. cfg.name .. "' chưa chạy - bấm <CR> để chạy") or "Chọn 1 profile bên trái"),
+      "  " .. (row and ("'" .. row_name(row) .. "' chưa chạy" .. (row.kind == "config" and " - bấm <CR> để chạy" or ""))
+        or "Chọn 1 dòng bên trái"),
     })
     vim.bo[buf].modifiable = false
   end
@@ -123,19 +182,32 @@ local function render()
   }
   state.line_map = {}
 
-  if not state.configs or #state.configs == 0 then
+  local test_entries = vim.tbl_filter(function(e) return e.kind == "test" end, session.list())
+
+  if (not state.configs or #state.configs == 0) and #test_entries == 0 then
     table.insert(lines, "(chưa có debug config nào cho project này - bấm 'a' để thêm)")
   else
-    for _, cfg in ipairs(state.configs) do
+    for _, cfg in ipairs(state.configs or {}) do
       local entry = session_for(cfg.name)
       local icon = entry and (STATUS_ICON[entry.status] or "?") or NOT_STARTED_ICON
       local status = entry and entry.status or "chưa chạy"
       local prof = (#cfg.maven_profiles > 0) and (" [" .. table.concat(cfg.maven_profiles, ",") .. "]") or ""
-      local port = (entry and ok_status and dap_status.ports[entry.name]) and (" :" .. dap_status.ports[entry.name]) or ""
+      local port_num = entry and ok_status and dap_status.ports[dap_status_key_for(entry)]
+      local port = port_num and (" :" .. port_num) or ""
       local module_name = vim.fn.fnamemodify(cfg.module_path, ":t")
       table.insert(lines, string.format("%s %-30s %-9s %s%s%s",
         icon, cfg.name, status, module_name, prof, port))
-      state.line_map[#lines] = cfg
+      state.line_map[#lines] = { kind = "config", config = cfg }
+    end
+    -- Ephemeral TEST runs - same idea as IntelliJ auto-generating a TEMPORARY Run Configuration
+    -- the instant you run a single test, listed alongside the saved profiles above.
+    for _, entry in ipairs(test_entries) do
+      local icon = STATUS_ICON[entry.status] or "?"
+      local port_num = ok_status and dap_status.ports[dap_status_key_for(entry)]
+      local port = port_num and (" :" .. port_num) or ""
+      table.insert(lines, string.format("%s %-30s %-9s (test)%s",
+        icon, entry.name, entry.status, port))
+      state.line_map[#lines] = { kind = "test", entry = entry }
     end
   end
 
@@ -144,8 +216,8 @@ local function render()
   vim.bo[state.bufnr].modifiable = false
 
   vim.api.nvim_buf_clear_namespace(state.bufnr, ns, 0, -1)
-  for lnum, cfg in pairs(state.line_map) do
-    local entry = session_for(cfg.name)
+  for lnum, row in pairs(state.line_map) do
+    local entry = row_session(row)
     local hl = entry and entry.status == "running" and "DiagnosticOk"
         or entry and entry.status == "starting" and "DiagnosticWarn"
         or "Comment"
@@ -173,14 +245,22 @@ local function goto_log()
   end
 end
 
----Runs the profile under the cursor - REUSES the existing tracked session for it if one already
----exists (running, starting, OR stopped), via session.restart (terminates first only if actually
----still running), instead of always registering a brand new row: re-running/pressing Enter on a
----profile is expected to behave like IntelliJ's "run this configuration" button, not add a
----duplicate entry every time.
+---Runs the profile/test under the cursor - REUSES the existing tracked session for it if one
+---already exists (running, starting, OR stopped) instead of always registering a brand new row:
+---re-running/pressing Enter is expected to behave like IntelliJ's "run this configuration"
+---button, not add a duplicate entry every time. "config" rows go through session.restart (or a
+---fresh debug_config_run if never launched at all); "test" rows go through test.lua's own
+---M.rerun(id), which replays the SAME test.jtm/jtc invocation (bufnr/lnum) it was first started
+---with, so a test session isn't in any way a second-class citizen here.
 local function run_selected()
-  local cfg = config_at_cursor()
-  if not cfg then return end
+  local row = row_at_cursor()
+  if not row then return end
+  if row.kind == "test" then
+    require("java-debug-model.test").rerun(row.entry.id)
+    vim.defer_fn(render, 300)
+    return
+  end
+  local cfg = row.config
   local jdm = require("java-debug-model")
   local existing = session_for(cfg.name)
   if existing then
@@ -197,10 +277,10 @@ local function run_selected()
 end
 
 local function focus_selected()
-  local cfg = config_at_cursor()
-  local entry = cfg and session_for(cfg.name)
+  local row = row_at_cursor()
+  local entry = row_session(row)
   if not entry then
-    vim.notify("java-debug-model: '" .. (cfg and cfg.name or "?") .. "' chưa chạy.", vim.log.levels.WARN)
+    vim.notify("java-debug-model: '" .. row_name(row) .. "' chưa chạy.", vim.log.levels.WARN)
     return
   end
   if not session.focus(entry.id) then
@@ -209,22 +289,32 @@ local function focus_selected()
 end
 
 local function stop_selected()
-  local cfg = config_at_cursor()
-  local entry = cfg and session_for(cfg.name)
+  local row = row_at_cursor()
+  local entry = row_session(row)
   if not entry or entry.status == "stopped" then
-    vim.notify("java-debug-model: '" .. (cfg and cfg.name or "?") .. "' chưa chạy.", vim.log.levels.INFO)
+    vim.notify("java-debug-model: '" .. row_name(row) .. "' chưa chạy.", vim.log.levels.INFO)
     return
   end
   session.terminate(entry.id, render)
   vim.notify("java-debug-model: đang tắt '" .. entry.name .. "'...", vim.log.levels.INFO)
 end
 
----Deletes the profile itself (config_store.remove) - a real destructive action (unlike the old
----session-registry "remove from list"), so this confirms first. Stops any running session for it
+---Removes a "test" row (just the ephemeral tracking entry - nothing saved to delete) or deletes
+---the profile itself for a "config" row (config_store.remove - a real destructive action, unlike
+---removing a test row, so THIS confirms first). Stops any running session for a config row
 ---beforehand so the debuggee doesn't end up orphaned/untracked.
 local function delete_selected()
-  local cfg = config_at_cursor()
-  if not cfg then return end
+  local row = row_at_cursor()
+  if not row then return end
+  if row.kind == "test" then
+    if row.entry.status ~= "stopped" then
+      session.terminate(row.entry.id, function() end)
+    end
+    session.remove(row.entry.id)
+    render()
+    return
+  end
+  local cfg = row.config
   vim.ui.select({ "Huỷ", "Xoá config '" .. cfg.name .. "'" }, {
     prompt = "Xoá debug config '" .. cfg.name .. "' ?",
   }, function(choice)
@@ -245,9 +335,13 @@ local function add_new()
 end
 
 local function edit_selected()
-  local cfg = config_at_cursor()
-  if not cfg or not state.root then return end
-  require("java-debug-model").debug_config_edit(state.root, cfg.name)
+  local row = row_at_cursor()
+  if not row or not state.root then return end
+  if row.kind == "test" then
+    vim.notify("java-debug-model: test tạm không có config để sửa.", vim.log.levels.WARN)
+    return
+  end
+  require("java-debug-model").debug_config_edit(state.root, row.config.name)
   vim.defer_fn(reload_configs, 300)
 end
 
@@ -265,6 +359,25 @@ function M.close()
   end
   state.winid = nil
   state.log_winid = nil
+end
+
+---Opens the panel (if not already) and moves the list cursor to whichever row is tracking
+---session `id` - works for a "test" row (matched by its own entry.id directly) same as a
+---"config" row whose CURRENT session happens to be `id`. Called right after a test run starts
+---(test.lua's own invoke()) so <leader>jtm/jtc feels like pressing "Run" in IntelliJ: the
+---Services-style panel pops up already focused on the test that just started, log streaming
+---live - no separate "now go find it in the list yourself" step.
+---@param id integer  session.SessionEntry.id
+function M.focus_entry(id)
+  M.open()
+  for lnum, row in pairs(state.line_map) do
+    local entry = row_session(row)
+    if entry and entry.id == id then
+      pcall(vim.api.nvim_win_set_cursor, state.winid, { lnum, 0 })
+      sync_log_to_cursor()
+      return
+    end
+  end
 end
 
 local listeners_registered = false
