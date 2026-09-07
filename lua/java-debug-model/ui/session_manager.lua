@@ -5,11 +5,13 @@
 -- console on the right if it's running; running/restarting/stopping acts on the profile under the
 -- cursor directly, no extra "which one?" picker needed since the picker IS the list itself.
 --
--- ALSO lists every ephemeral TEST run (test.lua registers these into session.lua with
--- kind="test") as its own row, the same way IntelliJ auto-generates a TEMPORARY Run
--- Configuration the moment you run a single test - these aren't backed by a config_store
--- DebugConfig at all (nothing to "edit" or "restart" the normal way, see the kind=="test" guards
--- throughout below), they just ride along in the same list/log-pane UI as the saved profiles.
+-- ALSO lists every TEST profile (test.lua/test_profile_store.lua - registered into session.lua
+-- with kind="test" while running) as its own row, the same way IntelliJ auto-generates a
+-- TEMPORARY Run Configuration the moment you run a single test - these aren't backed by a
+-- config_store DebugConfig (nothing to "edit" the normal way, see the kind=="test" guards
+-- throughout below), but DO persist to disk the same way a DebugConfig does (test_profile_store.lua
+-- mirrors config_store.lua's own JSON persistence) - so a test row survives a Neovim restart just
+-- like a saved profile row does, shown as "chưa chạy" until run again.
 local session = require("java-debug-model.session")
 local panel_registry = require("java-debug-model.ui.panel_registry")
 
@@ -24,6 +26,7 @@ local state = {
   placeholder_bufnr = nil, -- shown in the right pane when the selected profile has no log yet
   root = nil,           -- project root the list was last built for (pinned until 'R' reload)
   configs = nil,        -- config_store.list(root) as of the last render
+  test_profiles = nil,  -- test.list_profiles(root) as of the last render
   -- line number -> DebugConfig, rebuilt on every render (same pattern as project_tree.lua)
   line_map = {},
 }
@@ -38,8 +41,10 @@ local NOT_STARTED_ICON = "○"
 ---@class Row
 ---@field kind "config"|"test"
 ---@field config table|nil   DebugConfig - set when kind=="config"
----@field entry table|nil    session.SessionEntry - set when kind=="test" (the entry itself IS
----the row; a "test" row has no separate saved config to look one up from)
+---@field profile table|nil  test_profile_store.TestProfile - set when kind=="test"
+---@field entry table|nil    session.SessionEntry - set when a live session currently tracks this
+---row (either kind) - nil for a "chưa chạy" profile/config that hasn't been (re)launched yet this
+---Neovim session (including right after a restart, before it's run again).
 
 ---@return Row|nil
 local function row_at_cursor()
@@ -61,21 +66,31 @@ local function session_for(name)
   return found
 end
 
----Resolves a Row to its underlying session.SessionEntry (if any) regardless of kind - a "config"
----row looks one up by name (session_for), a "test" row already IS the entry.
+---Same as session_for, but for a "test" kind entry by profile name.
+---@param name string
+---@return table|nil session.SessionEntry
+local function session_for_test(name)
+  local found
+  for _, e in ipairs(session.list()) do
+    if e.kind == "test" and e.name == name then found = e end
+  end
+  return found
+end
+
+---Resolves a Row to its underlying session.SessionEntry, if one is currently tracking it (nil
+---for a config/profile that hasn't been launched yet this Neovim session).
 ---@param row Row|nil
 ---@return table|nil session.SessionEntry
 local function row_session(row)
   if not row then return nil end
-  if row.kind == "test" then return row.entry end
-  return session_for(row.config.name)
+  return row.entry
 end
 
 ---@param row Row|nil
 ---@return string
 local function row_name(row)
   if not row then return "?" end
-  return row.kind == "test" and row.entry.name or row.config.name
+  return row.kind == "test" and row.profile.name or row.config.name
 end
 
 ---dap_status.term_bufs/ports are keyed by whatever string the ACTUAL launch used as its DAP
@@ -182,9 +197,9 @@ local function render()
   }
   state.line_map = {}
 
-  local test_entries = vim.tbl_filter(function(e) return e.kind == "test" end, session.list())
+  local test_profiles = state.test_profiles or {}
 
-  if (not state.configs or #state.configs == 0) and #test_entries == 0 then
+  if (not state.configs or #state.configs == 0) and #test_profiles == 0 then
     table.insert(lines, "(chưa có debug config nào cho project này - bấm 'a' để thêm)")
   else
     for _, cfg in ipairs(state.configs or {}) do
@@ -197,17 +212,21 @@ local function render()
       local module_name = vim.fn.fnamemodify(cfg.module_path, ":t")
       table.insert(lines, string.format("%s %-30s %-9s %s%s%s",
         icon, cfg.name, status, module_name, prof, port))
-      state.line_map[#lines] = { kind = "config", config = cfg }
+      state.line_map[#lines] = { kind = "config", config = cfg, entry = entry }
     end
-    -- Ephemeral TEST runs - same idea as IntelliJ auto-generating a TEMPORARY Run Configuration
-    -- the instant you run a single test, listed alongside the saved profiles above.
-    for _, entry in ipairs(test_entries) do
-      local icon = STATUS_ICON[entry.status] or "?"
-      local port_num = ok_status and dap_status.ports[dap_status_key_for(entry)]
+    -- TEST profiles - same idea as IntelliJ auto-generating a TEMPORARY Run Configuration the
+    -- instant you run a single test, listed alongside the saved profiles above. Persisted
+    -- (test_profile_store.lua) so these still show up ("chưa chạy") right after a Neovim restart,
+    -- before entry (a LIVE session, if any) exists again this session.
+    for _, profile in ipairs(test_profiles) do
+      local entry = session_for_test(profile.name)
+      local icon = entry and (STATUS_ICON[entry.status] or "?") or NOT_STARTED_ICON
+      local status = entry and entry.status or "chưa chạy"
+      local port_num = entry and ok_status and dap_status.ports[dap_status_key_for(entry)]
       local port = port_num and (" :" .. port_num) or ""
       table.insert(lines, string.format("%s %-30s %-9s (test)%s",
-        icon, entry.name, entry.status, port))
-      state.line_map[#lines] = { kind = "test", entry = entry }
+        icon, profile.name, status, port))
+      state.line_map[#lines] = { kind = "test", profile = profile, entry = entry }
     end
   end
 
@@ -227,12 +246,14 @@ local function render()
   sync_log_to_cursor()
 end
 
----Refetches config_store's profile list for state.root and re-renders - called on open/'R', and
----after add/edit/delete so the list reflects the change immediately.
+---Refetches config_store's profile list AND test_profile_store's test profile list for
+---state.root and re-renders - called on open/'R', and after add/edit/delete so the list reflects
+---the change immediately.
 local function reload_configs()
   if not state.root then return end
   local jdm = require("java-debug-model")
   state.configs = jdm.config_store.list(state.root)
+  state.test_profiles = jdm.test.list_profiles(state.root)
   render()
 end
 
@@ -250,13 +271,15 @@ end
 ---re-running/pressing Enter is expected to behave like IntelliJ's "run this configuration"
 ---button, not add a duplicate entry every time. "config" rows go through session.restart (or a
 ---fresh debug_config_run if never launched at all); "test" rows go through test.lua's own
----M.rerun(id), which replays the SAME test.jtm/jtc invocation (bufnr/lnum) it was first started
----with, so a test session isn't in any way a second-class citizen here.
+---M.rerun_profile(root, name), which replays the SAME test.jtm/jtc invocation - reusing the exact
+---bufnr/lnum if this Neovim session still has it, otherwise reopening the persisted profile's
+---source file fresh (e.g. right after a Neovim restart) - so a test profile isn't in any way a
+---second-class citizen here, restart included.
 local function run_selected()
   local row = row_at_cursor()
   if not row then return end
   if row.kind == "test" then
-    require("java-debug-model.test").rerun(row.entry.id)
+    require("java-debug-model.test").rerun_profile(state.root, row.profile.name)
     vim.defer_fn(render, 300)
     return
   end
@@ -299,19 +322,22 @@ local function stop_selected()
   vim.notify("java-debug-model: đang tắt '" .. entry.name .. "'...", vim.log.levels.INFO)
 end
 
----Removes a "test" row (just the ephemeral tracking entry - nothing saved to delete) or deletes
----the profile itself for a "config" row (config_store.remove - a real destructive action, unlike
----removing a test row, so THIS confirms first). Stops any running session for a config row
----beforehand so the debuggee doesn't end up orphaned/untracked.
+---Deletes the profile under the cursor for real (test_profile_store.remove or config_store.remove
+---- both persisted to disk now, see test_profile_store.lua's own comment on why a "test" row is no
+---longer just an in-memory tracking entry) - confirms first for BOTH kinds, since both are now a
+---real, durable deletion. Stops any running session beforehand so the debuggee doesn't end up
+---orphaned/untracked.
 local function delete_selected()
   local row = row_at_cursor()
   if not row then return end
   if row.kind == "test" then
-    if row.entry.status ~= "stopped" then
-      session.terminate(row.entry.id, function() end)
-    end
-    session.remove(row.entry.id)
-    render()
+    vim.ui.select({ "Huỷ", "Xoá profile test '" .. row.profile.name .. "'" }, {
+      prompt = "Xoá profile test '" .. row.profile.name .. "' ?",
+    }, function(choice)
+      if not choice or choice == "Huỷ" then return end
+      require("java-debug-model").test.remove_profile(state.root, row.profile.name)
+      reload_configs()
+    end)
     return
   end
   local cfg = row.config

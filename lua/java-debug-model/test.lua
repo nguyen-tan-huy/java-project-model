@@ -4,14 +4,21 @@
 -- classpath correctness comes for free from jdtls.lua's resolution.
 --
 -- Also registers every test run into session.lua's registry (kind="test") - same as regular
--- debug launches - so it shows up as a TEMPORARY profile row in ui/session_manager.lua, exactly
--- like IntelliJ auto-generates a temporary Run Configuration the moment you run a single test:
--- same console-log capture (session.lua's OutputEvent listener already works for ANY tracked
--- session regardless of how it was launched), same stop/focus/RESTART actions (M.rerun below), no
+-- debug launches - so it shows up as a profile row in ui/session_manager.lua, exactly like
+-- IntelliJ auto-generates a temporary Run Configuration the moment you run a single test: same
+-- console-log capture (session.lua's OutputEvent listener already works for ANY tracked session
+-- regardless of how it was launched), same stop/focus/RESTART actions (M.rerun_profile below), no
 -- config_store.DebugConfig needed - and <leader>jtm/jtc auto-open+focus ui/session_manager.lua on
 -- the row that just started, same as pressing "Run" in IntelliJ pops the Services panel open.
+--
+-- UNLIKE session.lua's own in-memory registry (wiped every Neovim restart), test_profile_store.lua
+-- persists the "which file/scope/line" side of a test run to disk (mirrors config_store.lua's own
+-- DebugConfig persistence) - so a test profile's ROW survives quitting Neovim the same way a saved
+-- DebugConfig's row does, even though its live session obviously doesn't (nothing is still running
+-- after Neovim exits - session.terminate_all_sync already handles that, see session.lua).
 local results = require("java-debug-model.ui.test_results")
 local session = require("java-debug-model.session")
+local test_profile_store = require("java-debug-model.test_profile_store")
 
 local M = {}
 
@@ -22,7 +29,7 @@ local M = {}
 ---@field lnum integer  only meaningful for scope=="nearest_method"
 
 ---session.SessionEntry.id -> TestReplay, so ui/session_manager.lua's "run"/"restart" actions on a
----"test" row can re-invoke the EXACT same test (M.rerun below) - jdtls.dap's test_nearest_method/
+---"test" row can re-invoke the EXACT same test (M.rerun_profile below) - jdtls.dap's test_nearest_method/
 ---test_class both accept an explicit opts.bufnr/opts.lnum instead of always reading the CURRENT
 ---window's cursor, so replaying one doesn't require jumping back to the original source file/line
 ---first.
@@ -38,7 +45,7 @@ local replays = {}
 ---IMPORTANT: this MUST resolve purely from `bufnr`'s own content, never the CURRENTLY focused
 ---buffer/window. jdtls.util's own resolve_classname() ignores whatever bufnr you think you're
 ---passing it and always reads `vim.api.nvim_get_current_buf()`/`vim.fn.expand("%")` instead - fine
----for a fresh run (current buffer == bufnr there), but M.rerun() below calls this from
+---for a fresh run (current buffer == bufnr there), but M.rerun_profile() below calls this from
 ---ui/session_manager.lua's panel buffer (a DIFFERENT current buffer than the original test file),
 ---so calling into resolve_classname() there silently computes the panel's own name instead of the
 ---test's, the by-name match in invoke() below then fails to find the old session, and a rerun ends
@@ -65,8 +72,8 @@ end
 ---@param variant "run"|"debug"
 ---@param scope "nearest_method"|"class"
 ---@param opts table?  { bufnr?: integer, lnum?: integer }  defaults to the CURRENT buffer/cursor
----- pass these explicitly to replay a PREVIOUSLY started test (M.rerun) without needing to jump
----back to its source location first.
+---- pass these explicitly to replay a PREVIOUSLY started test (M.rerun_profile) without needing to
+---jump back to its source location first.
 local function invoke(variant, scope, opts)
   opts = opts or {}
   local ok_jdtls, jdtls_dap = pcall(require, "jdtls.dap")
@@ -95,6 +102,20 @@ local function invoke(variant, scope, opts)
 
   local jdm = require("java-debug-model")
   local name = display_name(bufnr, scope)
+  local root = jdm._find_root(bufnr)
+
+  -- Persist this profile (file/scope/line) to disk BEFORE registering the live session below, so
+  -- that by the time focus_in_session_manager()'s render() runs, ui/session_manager.lua's profile
+  -- list (test_profile_store.list(root)) already includes it and can attach the fresh session
+  -- entry to the right row - see test_profile_store.lua's own comment on why this exists (a saved
+  -- DebugConfig's row already survives a Neovim restart, a test run's row now does too).
+  test_profile_store.add(root, {
+    name = name,
+    file = vim.api.nvim_buf_get_name(bufnr),
+    scope = scope,
+    lnum = scope == "nearest_method" and lnum or nil,
+    variant = variant,
+  })
 
   -- Re-running the SAME test replaces its previous temporary entry instead of piling up a new
   -- row every time - matches IntelliJ reusing one temporary Run Configuration per test rerun.
@@ -108,7 +129,7 @@ local function invoke(variant, scope, opts)
   local session_id = session.register({
     name = name,
     kind = "test",
-    root = jdm._find_root(bufnr),
+    root = root,
   })
   replays[session_id] = { variant = variant, scope = scope, bufnr = bufnr, lnum = lnum }
   focus_in_session_manager(session_id)
@@ -185,23 +206,64 @@ function M.debug_nearest_method() invoke("debug", "nearest_method") end
 function M.run_class() invoke("run", "class") end
 function M.debug_class() invoke("debug", "class") end
 
----Re-invokes a PREVIOUSLY started test session by id - what ui/session_manager.lua's run/restart
----actions call for a "test" row, the same way they call session.restart() for a "config" row.
----No-op (with a hint) if this session was never one of ours (id unknown - e.g. already garbage
----collected some other way) or its source buffer got wiped since.
----@param id integer
-function M.rerun(id)
-  local replay = replays[id]
-  if not replay then
-    vim.notify("java-debug-model: không tìm thấy thông tin để chạy lại test này.", vim.log.levels.WARN)
+---@param root string
+---@return TestProfile[]
+function M.list_profiles(root)
+  return test_profile_store.list(root)
+end
+
+---Re-invokes a test profile by name - what ui/session_manager.lua's run/restart actions call for
+---a "test" row, the same way they call session.restart() for a "config" row. Prefers a LIVE replay
+---from THIS Neovim session (replays{}, keyed by session id - exact bufnr/lnum, no reopening
+---needed) when one is still around; falls back to the persisted profile
+---(test_profile_store.lua) otherwise, opening its source file fresh - this is what lets a profile
+---be re-run after a Neovim restart, when replays{} is empty and no "test" session.SessionEntry
+---exists yet either.
+---@param root string
+---@param name string
+function M.rerun_profile(root, name)
+  local live_id
+  for _, e in ipairs(session.list()) do
+    if e.kind == "test" and e.name == name then live_id = e.id end
+  end
+  local replay = live_id and replays[live_id]
+  if replay and vim.api.nvim_buf_is_valid(replay.bufnr) then
+    invoke(replay.variant, replay.scope, { bufnr = replay.bufnr, lnum = replay.lnum })
     return
   end
-  if not vim.api.nvim_buf_is_valid(replay.bufnr) then
-    vim.notify("java-debug-model: buffer gốc của test này đã đóng - mở lại file rồi dùng <leader>jtm/jtc.",
+
+  local profile = test_profile_store.get(root, name)
+  if not profile then
+    vim.notify("java-debug-model: không tìm thấy profile test '" .. name .. "'.", vim.log.levels.WARN)
+    return
+  end
+  if vim.fn.filereadable(profile.file) == 0 then
+    vim.notify("java-debug-model: file gốc của profile '" .. name .. "' không còn tồn tại: " .. profile.file,
       vim.log.levels.WARN)
     return
   end
-  invoke(replay.variant, replay.scope, { bufnr = replay.bufnr, lnum = replay.lnum })
+  local buf = vim.fn.bufadd(profile.file)
+  vim.fn.bufload(buf)
+  invoke(profile.variant or "debug", profile.scope, { bufnr = buf, lnum = profile.lnum })
+end
+
+---Removes a test profile entirely: stops/removes any live session tracking it, then deletes it
+---from disk (test_profile_store.lua) - the "test" row equivalent of config_store.remove for a
+---"config" row (both are real, persisted deletions now, so ui/session_manager.lua's delete
+---confirms first for both the same way).
+---@param root string
+---@param name string
+function M.remove_profile(root, name)
+  for _, e in ipairs(session.list()) do
+    if e.kind == "test" and e.name == name then
+      if e.status ~= "stopped" then
+        session.terminate(e.id, function() end)
+      end
+      session.remove(e.id)
+      replays[e.id] = nil
+    end
+  end
+  test_profile_store.remove(root, name)
 end
 
 ---Re-invokes the run for just the failed methods' locations from the last
