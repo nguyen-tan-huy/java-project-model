@@ -1,7 +1,23 @@
--- Wraps jdtls.test_nearest_method()/test_class() directly - the java-test
--- bundle already finds @Test methods (JUnit 4/5, parameterized, TestNG)
--- correctly, so this module never reimplements discovery. Cross-module
--- classpath correctness comes for free from jdtls.lua's resolution.
+-- Wraps jdtls.test_nearest_method()/test_class() - the java-test bundle
+-- already finds @Test methods (JUnit 4/5, parameterized, TestNG) correctly,
+-- so this module never reimplements discovery, and it deliberately does NOT
+-- hand-build classPaths/modulePaths itself (a previous version of this file
+-- tried that and broke every test run: `vscode.java.test.junit.argument`'s
+-- resolved classpath carries the JUnit/TestNG runner harness jars - e.g.
+-- org.eclipse.jdt.internal.junit.runner.RemoteTestRunner - which live in the
+-- java-test/java-debug LSP bundles, NOT in any Maven dependency, so the
+-- Project Model has no way to reproduce them; wholesale-replacing classPaths
+-- with the Project Model's own resolved list drops those runner jars and the
+-- test JVM fails immediately with ClassNotFoundException on RemoteTestRunner).
+--
+-- Instead, `invoke()` below calls jdm.get_project(root, ...) BEFORE running
+-- the test purely for its side effect: get_project() -> sync_jdtls_workspace()
+-- pushes every module the Project Model knows about (reactor AND orphan/
+-- independent poms) into jdt.ls as a workspaceFolder (jdtls.lua:190
+-- sync_workspace_folders) - so jdt.ls's OWN classpath resolution for the test
+-- (which the java-test bundle needs regardless) already sees the same set of
+-- modules the Project Model does, without java-debug-model needing to
+-- reimplement classpath resolution for tests at all.
 --
 -- Also registers every test run into session.lua's registry (kind="test") - same as regular
 -- debug launches - so it shows up as a profile row in ui/session_manager.lua, exactly like
@@ -178,27 +194,34 @@ local function invoke(variant, scope, opts)
   end
   if ok_dap then vim.defer_fn(poll_for_new_session, 100) end
 
-  local config_overrides = variant == "run" and { noDebug = true } or nil
-  local invoke_opts = {
-    bufnr = bufnr,
-    lnum = scope == "nearest_method" and lnum or nil,
-    config_overrides = config_overrides,
-    -- Reuses the fresh-port/session-per-launch mechanics from dap.lua/session.lua:
-    -- nvim-jdtls's test runner goes through the same vscode.java.startDebugSession
-    -- flow, so a test-debug session doesn't block other concurrent sessions.
-    -- jdtls.dap's own runner calls after_test(items, tests): items are
-    -- quickfix-shaped failure entries, tests are the full pass+fail list
-    -- parsed from the JUnit reporter protocol.
-    after_test = function(items, tests)
-      results.record(items, tests)
-    end,
-  }
+  -- get_project() here is purely for its side effect (sync_jdtls_workspace -> every Project
+  -- Model module, including orphan poms, gets pushed into jdt.ls as a workspaceFolder) - see
+  -- the module doc comment at the top of this file for why classPaths itself is left alone.
+  -- Cheap once cached (watcher.lua), so this doesn't add a perceptible delay to the common case.
+  jdm.get_project(root, function()
+    local config_overrides = variant == "run" and { noDebug = true } or nil
 
-  if scope == "nearest_method" then
-    jdtls_dap.test_nearest_method(invoke_opts)
-  else
-    jdtls_dap.test_class(invoke_opts)
-  end
+    local invoke_opts = {
+      bufnr = bufnr,
+      lnum = scope == "nearest_method" and lnum or nil,
+      config_overrides = config_overrides,
+      -- Reuses the fresh-port/session-per-launch mechanics from dap.lua/session.lua:
+      -- nvim-jdtls's test runner goes through the same vscode.java.startDebugSession
+      -- flow, so a test-debug session doesn't block other concurrent sessions.
+      -- jdtls.dap's own runner calls after_test(items, tests): items are
+      -- quickfix-shaped failure entries, tests are the full pass+fail list
+      -- parsed from the JUnit reporter protocol.
+      after_test = function(items, tests)
+        results.record(items, tests)
+      end,
+    }
+
+    if scope == "nearest_method" then
+      jdtls_dap.test_nearest_method(invoke_opts)
+    else
+      jdtls_dap.test_class(invoke_opts)
+    end
+  end)
 end
 
 function M.run_nearest_method() invoke("run", "nearest_method") end
@@ -278,15 +301,24 @@ function M.rerun_failed(variant)
   local ok_jdtls, jdtls_dap = pcall(require, "jdtls.dap")
   if not ok_jdtls then return end
 
-  local config_overrides = variant == "run" and { noDebug = true } or nil
+  local jdm = require("java-debug-model")
   for _, failure in ipairs(failed) do
     if failure.file then
       vim.cmd("edit " .. vim.fn.fnameescape(failure.file))
       vim.api.nvim_win_set_cursor(0, { failure.line or 1, 0 })
-      jdtls_dap.test_nearest_method({
-        config_overrides = config_overrides,
-        after_test = function(items, tests) results.record(items, tests) end,
-      })
+      local bufnr = vim.api.nvim_get_current_buf()
+      local root = jdm._find_root(bufnr)
+
+      -- Same sync-before-run as invoke() above (see module doc comment) - ensures jdt.ls's
+      -- workspace folders reflect the full Project Model before it resolves this test's classpath.
+      local config_overrides = variant == "run" and { noDebug = true } or nil
+      jdm.get_project(root, function()
+        jdtls_dap.test_nearest_method({
+          bufnr = bufnr,
+          config_overrides = config_overrides,
+          after_test = function(items, tests) results.record(items, tests) end,
+        })
+      end)
     end
   end
 end
