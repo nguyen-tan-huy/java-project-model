@@ -5,6 +5,8 @@ local panel_registry = require("java-debug-model.ui.panel_registry")
 
 local M = {}
 
+local render -- forward-declared: refresh_open_editors() (below) calls it before its definition
+
 ---@class TreeNode
 ---@field kind "project"|"module"|"deps"|"source_root"|"dir"|"file"
 ---@field label string
@@ -92,6 +94,7 @@ local function setup_highlights()
   hl(0, "JavaTreeProjectIcon", { link = "Title", default = true })
   hl(0, "JavaTreeModuleIcon", { link = "Function", default = true })
   hl(0, "JavaTreeDepsIcon", { link = "Special", default = true })
+  hl(0, "JavaTreeOpenEditorsIcon", { link = "Special", default = true })
   hl(0, "JavaTreeSourceRootIcon", { link = "String", default = true })
   hl(0, "JavaTreeSourceRootTestIcon", { link = "DiagnosticWarn", default = true })
   hl(0, "JavaTreeDirIcon", { link = "Directory", default = true })
@@ -102,14 +105,70 @@ local function setup_highlights()
   hl(0, "JavaTreeMarker", { link = "Comment", default = true })
 end
 
+---Buffer thật đang mở (loaded, buflisted, buftype thường, có tên file) - loại "gom" TẤT CẢ lại
+---1 chỗ bất kể thuộc module nào, giống "Open Editors" của IntelliJ, thay vì rời rạc theo module.
+---@return { bufnr: integer, path: string }[]
+local function list_open_buffers()
+  local bufs = {}
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) and vim.bo[bufnr].buflisted and vim.bo[bufnr].buftype == "" then
+      local name = vim.api.nvim_buf_get_name(bufnr)
+      if name ~= "" then
+        table.insert(bufs, { bufnr = bufnr, path = name })
+      end
+    end
+  end
+  table.sort(bufs, function(a, b) return a.path < b.path end)
+  return bufs
+end
+
+---@param depth integer
+local function build_open_editors_node(depth)
+  local node = {
+    kind = "open_editors",
+    label = "Open Editors",
+    depth = depth,
+    expanded = true,
+    children = {},
+  }
+  for _, buf in ipairs(list_open_buffers()) do
+    local relpath = vim.fn.fnamemodify(buf.path, ":~:.")
+    table.insert(node.children, {
+      kind = "file",
+      label = vim.fn.fnamemodify(buf.path, ":t") .. " (" .. relpath .. ")",
+      path = buf.path,
+      depth = depth + 1,
+      expanded = false,
+      children = {},
+    })
+  end
+  return node
+end
+
 local function build_tree(project)
   local root_node = {
     kind = "project", label = "Project", depth = 0, expanded = true, children = {},
   }
+  table.insert(root_node.children, build_open_editors_node(1))
   for _, mod in ipairs(project.modules) do
     table.insert(root_node.children, build_module_node(mod, 1))
   end
   return root_node
+end
+
+---Rebuilds ONLY the "Open Editors" node in place (children[1] - always inserted first in
+---build_tree above) so gõ mở/đóng buffer không phải render lại toàn bộ module tree, và không mất
+---trạng thái expand của các module khác.
+local function refresh_open_editors()
+  if not state.tree or not state.tree.children then return end
+  local oe = state.tree.children[1]
+  if not oe or oe.kind ~= "open_editors" then return end
+  local new_node = build_open_editors_node(oe.depth)
+  new_node.expanded = oe.expanded
+  state.tree.children[1] = new_node
+  if state.bufnr and vim.api.nvim_buf_is_valid(state.bufnr) then
+    render()
+  end
 end
 
 ---Lazily expands `node` in place, populating its `children` the first time.
@@ -157,7 +216,74 @@ local function ensure_children(node)
   end
 end
 
-local ICONS = { project = "", module = "󰏗", deps = "", source_root = "", dir = "", file = "" }
+---@param path string
+---@param prefix string
+local function path_starts_with(path, prefix)
+  return path == prefix or path:sub(1, #prefix + 1) == prefix .. "/"
+end
+
+---Module có path DÀI NHẤT chứa `path` - phòng trường hợp module lồng nhau (module con nằm bên
+---trong thư mục của module cha) thì phải chọn module con (khớp cụ thể hơn), không phải cha.
+---@param project table Project
+---@param path string
+local function find_module_for_path(project, path)
+  local best
+  for _, mod in ipairs(project.modules) do
+    if path_starts_with(path, mod.path) then
+      if not best or #mod.path > #best.path then best = mod end
+    end
+  end
+  return best
+end
+
+---Mở rộng dần từ module chứa `target_path` xuống đúng node file/thư mục đó (dùng ensure_children
+---ở trên tại từng cấp, giống hệt bấm "o" thủ công từng cấp) - phục vụ "locate file đang mở trong
+---buffer vào đúng chỗ của nó trên project tree", KHÁC với nhóm "Open Editors" (nhóm đó liệt kê
+---phẳng, không phản ánh vị trí thật trong cây module/source root).
+---@param root_node TreeNode
+---@param project table Project
+---@param target_path string
+---@return TreeNode|nil found  node khớp gần đúng nhất tìm được (đúng file nếu tồn tại, hoặc dừng
+---ở thư mục cha gần nhất nếu 1 đoạn path nào đó không tìm thấy con khớp)
+local function locate_path_in_tree(root_node, project, target_path)
+  local mod = find_module_for_path(project, target_path)
+  if not mod then return nil end
+
+  local module_node
+  for _, child in ipairs(root_node.children) do
+    if child.kind == "module" and child.data == mod then
+      module_node = child
+      break
+    end
+  end
+  if not module_node then return nil end
+
+  ensure_children(module_node)
+  module_node.expanded = true
+  if target_path == mod.path then return module_node end
+
+  local remaining = target_path:sub(#mod.path + 2) -- bỏ "mod.path/" ở đầu
+  local current = module_node
+  for seg in remaining:gmatch("[^/]+") do
+    ensure_children(current)
+    local found
+    for _, c in ipairs(current.children or {}) do
+      if c.label == seg then
+        found = c
+        break
+      end
+    end
+    if not found then return current end
+    current = found
+    ensure_children(current)
+    if current.children then current.expanded = true end
+  end
+  return current
+end
+
+local ICONS = {
+  project = "", module = "󰏗", deps = "", open_editors = "", source_root = "", dir = "", file = "",
+}
 
 ---Per-extension icon+highlight for a REAL file node (node.path set - excludes the "deps" list's
 ---own kind="file" entries, which are dependency descriptors like "org.slf4j:slf4j-api:jar:...",
@@ -198,6 +324,7 @@ local function icon_hl(node, devicon_hl)
     project = "JavaTreeProjectIcon",
     module = "JavaTreeModuleIcon",
     deps = "JavaTreeDepsIcon",
+    open_editors = "JavaTreeOpenEditorsIcon",
     source_root = "JavaTreeSourceRootIcon",
     dir = "JavaTreeDirIcon",
     file = "JavaTreeFileIcon",
@@ -206,7 +333,7 @@ end
 
 local ns = vim.api.nvim_create_namespace("java_debug_model_project_tree")
 
-local function render()
+render = function()
   setup_highlights()
   local lines = {}
   state.line_map = {}
@@ -306,6 +433,26 @@ local function toggle_at_cursor()
     auto_expand_chain(node)
   end
   render()
+end
+
+---Thu gọn hết mọi node đã mở (module/deps/source_root/dir) về lại đúng danh sách module - giữ
+---riêng root "Project" (và nhóm "Open Editors") luôn mở, giống nút "Collapse All" (X) của
+---IntelliJ. KHÔNG xoá children đã lazy-load (chỉ đổi expanded=false) nên mở lại không phải quét
+---đĩa lần nữa.
+local function collapse_all()
+  local function collapse(node)
+    if node.depth > 0 and node.kind ~= "open_editors" then
+      node.expanded = false
+    end
+    if node.children then
+      for _, c in ipairs(node.children) do collapse(c) end
+    end
+  end
+  if state.tree then
+    collapse(state.tree)
+    render()
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  end
 end
 
 local function node_at_cursor()
@@ -500,7 +647,18 @@ function M.open(root, project)
     vim.keymap.set("n", "o", toggle_at_cursor, { buffer = state.bufnr, nowait = true })
     vim.keymap.set("n", "a", add_at_cursor, { buffer = state.bufnr, nowait = true, desc = "Thêm file/thư mục mới" })
     vim.keymap.set("n", "d", delete_at_cursor, { buffer = state.bufnr, nowait = true, desc = "Xoá file/thư mục" })
+    vim.keymap.set("n", "W", collapse_all, { buffer = state.bufnr, nowait = true, desc = "Thu gọn hết (Collapse All)" })
     vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = state.bufnr, nowait = true })
+
+    -- Cập nhật nhóm "Open Editors" ngay khi buffer nào đó mở/đóng - chỉ đăng ký 1 LẦN (nằm
+    -- trong khối "tạo bufnr lần đầu" này) vì buffer list là trạng thái toàn cục, không gắn với
+    -- riêng cửa sổ tree - đóng/mở lại cây không cần đăng ký lại.
+    vim.api.nvim_create_autocmd({ "BufAdd", "BufDelete", "BufWipeout", "BufFilePost" }, {
+      group = vim.api.nvim_create_augroup("JavaDebugModelOpenEditors", { clear = true }),
+      callback = function()
+        vim.schedule(refresh_open_editors)
+      end,
+    })
   end
 
   local winid = vim.fn.bufwinid(state.bufnr)
@@ -570,6 +728,44 @@ function M.refresh(project)
 
   if state.bufnr and vim.api.nvim_buf_is_valid(state.bufnr) then
     render()
+  end
+end
+
+---Mở (nếu chưa mở) cây project rồi cuộn/focus tới đúng vị trí thật của `bufnr` trong cây module/
+---source root - giống nút "Locate/Select Opened File" của IntelliJ. KHÁC nhóm "Open Editors" ở
+---đầu cây (nhóm đó chỉ liệt kê phẳng, không cho biết file nằm ở module/thư mục nào).
+---@param root string
+---@param project table Project
+---@param bufnr integer|nil  mặc định buffer hiện tại
+function M.locate(root, project, bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  if path == "" then
+    vim.notify("java-debug-model: buffer hiện tại không phải 1 file thật.", vim.log.levels.WARN)
+    return
+  end
+
+  if not M.is_open() or state.root ~= root then
+    M.open(root, project)
+  else
+    state.project = project
+  end
+
+  local node = locate_path_in_tree(state.tree, state.project, path)
+  if not node then
+    vim.notify("java-debug-model: không tìm thấy " .. path .. " trong project tree hiện tại.",
+      vim.log.levels.WARN)
+    return
+  end
+  render()
+
+  for lnum, n in pairs(state.line_map) do
+    if n == node then
+      vim.api.nvim_set_current_win(state.tree_winid)
+      vim.api.nvim_win_set_cursor(state.tree_winid, { lnum, 0 })
+      vim.cmd("normal! zz")
+      break
+    end
   end
 end
 

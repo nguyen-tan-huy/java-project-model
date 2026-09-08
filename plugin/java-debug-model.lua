@@ -150,4 +150,11 @@ command("JavaProjectTree", function()
   end)
 end, {})
 
+command("JavaProjectTreeLocate", function()
+  local bufnr = vim.api.nvim_get_current_buf()
+  jdm().get_project(current_root(), function(project)
+    if project then jdm().project_tree.locate(current_root(), project, bufnr) end
+  end)
+end, {})
+
 command("JavaLayoutReset", function() jdm().reset_layout(current_root()) end, {})
