@@ -42,6 +42,9 @@ are Maven's job, never a hand-rolled parser's.
 - Maven on `PATH` (or a `./mvnw` wrapper in the project root)
 - The `java-debug` and `java-test` jdtls bundle jars (e.g. via Mason's
   `java-debug-adapter` and `java-test` packages)
+- [nui.nvim](https://github.com/MunifTanjim/nui.nvim) - optional, only needed for the
+  IntelliJ-style Config Panel (`:JavaConfigPanel`) and toolbar (`:JavaToolbar`). Every other
+  feature, including `:JavaDebugConfigAdd`'s plain prompt-based form, works without it.
 
 ## Installation (lazy.nvim)
 
@@ -52,6 +55,7 @@ are Maven's job, never a hand-rolled parser's.
     "mfussenegger/nvim-jdtls",
     "mfussenegger/nvim-dap",
     "rcarriga/nvim-dap-ui",
+    "MunifTanjim/nui.nvim", -- optional: powers :JavaConfigPanel and :JavaToolbar
   },
   config = function()
     require("java-debug-model").setup({
@@ -68,7 +72,25 @@ are Maven's job, never a hand-rolled parser's.
       },
       active_profiles = {},       -- Maven profiles applied to every resolve
       -- open_j9_java_exec = "/path/to/openj9/bin/java",  -- optional, debug target only
-      auto_attach = false,        -- true to auto-wire a FileType java autocmd
+      auto_attach = false,          -- true to attach jdtls immediately if cwd already resolves
+                                     -- a Maven root (no need to open a .java file first), plus
+                                     -- a FileType java autocmd as a fallback for when it doesn't
+      bufferline_enabled = true,    -- adds an open-buffer tab-list row to the toolbar's own
+                                     -- bar (see below) - plain text, no Config name repeated
+                                     -- there. Set to false to drop that row, e.g. if you run a
+                                     -- separate bufferline plugin instead.
+      toolbar_auto_open = true,     -- open the toolbar - a single docked bar with "Config:
+                                     -- <name>" on its own (taller) row, plus the tab-list row
+                                     -- right below it when bufferline_enabled - on the first
+                                     -- .java buffer per root; it's a real docked window, so it
+                                     -- does NOT reopen itself across a restart on its own
+                                     -- otherwise
+      restore_layout_on_start = true, -- reopen whatever files/panels were open last time
+                                       -- (see "Project layout persistence" below)
+      run_debug_keymaps = { run = "<leader>jr", debug = "<leader>jd", select = "<leader>jc" },
+        -- GLOBAL keymaps for Run/Debug/select-active-config, work from any window/buffer -
+        -- not just while the toolbar's own split is focused (its r/d/c keymaps only fire
+        -- while that specific window is current). Set any field (or the whole table) to false.
     })
   end,
 }
@@ -98,6 +120,29 @@ require("java-debug-model").start_or_attach(vim.api.nvim_get_current_buf())
 :JavaDebugConfigFromFile                  -- auto-create from current buffer's main method
 :JavaDebugConfigScan                       -- whole-project main-method scan -> picker
 
+:JavaConfigPanel                            -- IntelliJ "Edit Configurations" equivalent: nui.nvim
+                                             -- list+form panel over the same DebugConfig data,
+                                             -- keyboard-only (list: a/d to add/delete, <CR> to
+                                             -- select; form: a REAL editable buffer - move the
+                                             -- cursor to a field and edit it with normal Vim
+                                             -- commands, <CR> in insert mode confirms instead of
+                                             -- inserting a newline; Module/JDK stay <CR> pickers)
+:JavaToolbar                                -- toggle the docked bar: "Config: <name>",
+                                             -- right-aligned, plus an open-buffer tab-list row
+                                             -- right below it (opts.bufferline_enabled) - both in
+                                             -- the SAME window, no gap between them. c/<CR> on the
+                                             -- Config row opens the picker, or <leader>jc/
+                                             -- :JavaConfigSelect from anywhere. No Run/Debug
+                                             -- buttons here - use <leader>jr/<leader>jd (opts.
+                                             -- run_debug_keymaps) or the commands below
+:JavaToolbarRun                             -- run (no breakpoints) the active config directly
+:JavaToolbarDebug                           -- debug the active config directly
+:JavaConfigSelect [name]                    -- set the toolbar's active Run/Debug Configuration
+                                             -- (prompts via vim.ui.select when name is omitted)
+:JavaDebugMainUnderCursor                   -- debug the `main` method the cursor is on (see the
+                                             -- ">" gutter sign) - auto-creates a DebugConfig the
+                                             -- first time, reuses it after that
+
 :TestNearestMethod                          -- run test under cursor
 :TestClass                                   -- run all tests in current class
 
@@ -110,7 +155,23 @@ require("java-debug-model").start_or_attach(vim.api.nvim_get_current_buf())
 :JavaSessionStatus                                 -- print running/paused/stopped status
 :JavaTestResults                                    -- open the last test run's pass/fail panel
 :JavaProjectTree                                     -- open the module tree UI
+
+:JavaLayoutSave                                       -- save which files/panels are open right now
+:JavaLayoutRestore                                     -- reopen whatever was last saved (bypasses
+                                                        -- the once-per-session guard restore_layout_
+                                                        -- on_start's automatic restore uses)
 ```
+
+## Project layout persistence
+
+With `restore_layout_on_start = true` (the default), `layout_state.lua` remembers, per project
+root, which files were open (and which one was focused) and which of this plugin's own panels
+(Project Tree, Maven Panel, Session Manager, Toolbar) were up - saved automatically on
+`VimLeavePre`, restored automatically the first time that root is resolved in a new Neovim
+session. This is scoped to what the plugin itself owns: the file *buffer list* and its own panel
+layout, not exact per-tab/per-window geometry the way `:mksession` handles a whole session - pair
+it with a session plugin (or `:mksession`) if you want that too. `:JavaLayoutSave`/
+`:JavaLayoutRestore` trigger either half by hand.
 
 ## Architecture
 

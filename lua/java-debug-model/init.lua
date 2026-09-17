@@ -9,6 +9,8 @@ local dap = require("java-debug-model.dap")
 local session = require("java-debug-model.session")
 local maven_runner = require("java-debug-model.maven_runner")
 local maven_jdk = require("java-debug-model.maven_jdk")
+local active_config = require("java-debug-model.active_config")
+local layout_state = require("java-debug-model.layout_state")
 local test = require("java-debug-model.test")
 
 local project_tree = require("java-debug-model.ui.project_tree")
@@ -16,6 +18,11 @@ local maven_panel = require("java-debug-model.ui.maven_panel")
 local session_picker = require("java-debug-model.ui.session_picker")
 local test_results = require("java-debug-model.ui.test_results")
 local config_form = require("java-debug-model.ui.config_form")
+local config_panel = require("java-debug-model.ui.config_panel")
+local toolbar = require("java-debug-model.ui.toolbar")
+local bufferline = require("java-debug-model.ui.bufferline")
+local statusline = require("java-debug-model.ui.statusline")
+local main_gutter = require("java-debug-model.ui.main_gutter")
 local dependency_tree_ui = require("java-debug-model.ui.dependency_tree")
 local session_manager_ui = require("java-debug-model.ui.session_manager")
 
@@ -35,6 +42,68 @@ local DEFAULT_JDTLS_PREBUILT_URL =
 
 M.opts = {
   auto_attach = false,
+  -- Whether ui/bufferline.lua's IntelliJ-style open-buffer tab row is turned on. It attaches via
+  -- Neovim's per-window 'winbar' option to just the real editor window(s) - scoped to the editor
+  -- panel's own width, stopping at the Project Tree/Maven Panel sidebars, matching IntelliJ's own
+  -- tab strip ("phần tab bar chỉ nằm trên panel editor giống intellij"). It used to render as an
+  -- extra line inside ui/toolbar.lua's own docked bar instead, which fixed an earlier seam issue
+  -- but made the tab row span the FULL tabpage width (sidebars included) since a docked nui.Split
+  -- can only ever be full-width - see ui/bufferline.lua's own doc comment for the full history.
+  -- Set to false to disable the tab row entirely, e.g. if you run a separate bufferline plugin.
+  bufferline_enabled = true,
+  -- IntelliJ-style single global status bar (ui/statusline.lua) at the very bottom of the whole
+  -- screen - a breadcrumb of the current file's real module/folder location, plus this plugin's
+  -- own "something is running"/DAP-session signals on the right. `laststatus = 3` is what makes
+  -- it ONE bar instead of one per split window. Set to false to leave `'statusline'`/`laststatus`
+  -- alone, e.g. if you run a separate statusline plugin instead.
+  statusline_enabled = true,
+  -- Auto-opens ui/toolbar.lua's own bar (where "Config: <active config name>" renders - the
+  -- open-buffer tab row, per bufferline_enabled above, is independent of this and attaches to
+  -- editor windows directly) the first time a `.java` buffer is seen for a given root (once per
+  -- root per Neovim session). It does NOT
+  -- reappear across a Neovim restart purely on its own if you close it by hand (see toolbar.lua's
+  -- own doc comment: it's a real docked window, not tracked as "was open" the way
+  -- reset_layout()'s three panels are) - this flag is what makes every fresh Neovim session start
+  -- with it up again.
+  toolbar_auto_open = true,
+  -- IntelliJ-style gutter run icons (ui/main_gutter.lua) next to a `main` method ("▶") and next to
+  -- an `@Test` method ("⏵") - clickable (mouse click on the icon, or `:JavaDebugMainUnderCursor`
+  -- with the cursor on that line), always launching via the debug adapter. A main method
+  -- auto-creates (and reuses after that) a DebugConfig; a test method delegates to test.lua, which
+  -- already unconditionally saves a test profile on every run. On by default since it only ever
+  -- activates for currently-open java buffers with jdtls attached - set to false to skip
+  -- registering its autocmds/mouse mapping entirely.
+  main_gutter_enabled = true,
+  -- "thêm tính năng lưu trạng thái của project khi đang mở... khi vào lại load lại không phải mở
+  -- lại từ đầu" (save what was open so re-entering the project restores it instead of starting
+  -- from scratch) - restores whichever files were open and whichever of this plugin's own panels
+  -- (Project Tree/Maven Panel/Session Manager/Toolbar) were up, via layout_state.lua. Saved
+  -- automatically on VimLeavePre for whatever root was last active; restored once per root per
+  -- session, the first time that root is resolved (immediately at setup() if cwd already resolves
+  -- to one, or on the first .java FileType event otherwise - same dual-trigger reasoning as
+  -- toolbar_auto_open). Set to false to opt out of both halves.
+  restore_layout_on_start = true,
+  -- Global keymaps for Run/Debug on the ACTIVE config, working from ANY window/buffer - not just
+  -- while the toolbar's own split happens to be focused. Reported for real: pressing 'd'/'r'
+  -- while merely LOOKING at the toolbar did nothing, because those are window-local keymaps on
+  -- the toolbar's own split (only live while that specific window is current) - Neovim has no
+  -- concept of "the visible Run/Debug buttons" being clickable/pressable independent of actual
+  -- window focus the way a real IDE's toolbar is. The toolbar still has no Run/Debug BUTTONS at
+  -- all (that decision stands - see ui/toolbar.lua's own module doc), so these keymaps remain the
+  -- only way to trigger them; mouse-click support itself came back for the Config/module dropdowns
+  -- (ui/toolbar.lua's own `<LeftRelease>` handler) and, separately, for the tab row's own switch/
+  -- close clicks (ui/bufferline.lua's own winbar click shims).
+  -- `<leader>j*` matches jdtls_launcher.lua's own convention (<leader>jv/jR/joi/...); set any field
+  -- to false to disable just that one, or the whole table to false to disable all four and rely on
+  -- :JavaToolbarRun/:JavaToolbarDebug/:JavaConfigSelect (or the toolbar's own r/d/c/m, plus mouse
+  -- clicks) instead. `select`/`select_module` open the same picker menus the toolbar's 'c'/'m'
+  -- keys (or clicking the Config text / project-name text) would.
+  run_debug_keymaps = {
+    run = "<leader>jr",
+    debug = "<leader>jd",
+    select = "<leader>jc",
+    select_module = "<leader>jm",
+  },
   active_profiles = {},
   open_j9_java_exec = nil,
   jdtls_bundle_globs = {},
@@ -232,48 +301,55 @@ function M.get_project(root, callback, profiles)
   end)
 end
 
----Closes then reopens every currently-open "IDE layout" panel (Project Tree, Maven Lifecycle,
----Session Manager) in a FIXED order (tree first, then session manager, then maven panel) so
----their window geometry comes out the same every time, regardless of what order they happened to
----be opened in originally. Neovim's plain window-split model has no notion of "docking zones"
----like IntelliJ's tool windows do - `topleft`/`botright` splits each just carve out a slice of
----the WHOLE tab, so opening/closing several of these independently-positioned panels in different
----orders can squash one into a sliver (confirmed for real: reopening Project Tree while Session
----Manager's bottom band was already open left Session Manager's own list column squeezed down to
----~10 characters wide). This is the "fix the layout" escape hatch for when that happens - a
----from-scratch relayout is simpler and more robust than trying to detect/correct a squashed
----window after the fact.
+---Closes then reopens every currently-open "IDE layout" panel (Toolbar, Project Tree, Maven
+---Lifecycle, Session Manager) in a FIXED order (tree first, then session manager, then maven
+---panel, then toolbar LAST) so their window geometry comes out the same every time, regardless of
+---what order they happened to be opened in originally. Neovim's plain window-split model has no
+---notion of "docking zones" like IntelliJ's tool windows do - `topleft`/`botright` splits each
+---just carve out a slice of the WHOLE tab, so opening/closing several of these
+---independently-positioned panels in different orders can squash one into a sliver (confirmed for
+---real: reopening Project Tree while Session Manager's bottom band was already open left Session
+---Manager's own list column squeezed down to ~10 characters wide; separately, opening the toolbar
+---BEFORE Project Tree/Maven Panel/Session Manager shrinks its row down to whatever's left of
+---their column instead of spanning full width - see ui/toolbar.lua's own M.redock comment). Every
+---one of those three panels' own open() already calls toolbar.redock() right after creating its
+---split, so opening toolbar last here is a belt-and-suspenders ordering, not the only fix. This is
+---the "fix the layout" escape hatch for when squashing happens anyway - a from-scratch relayout is
+---simpler and more robust than trying to detect/correct a squashed window after the fact.
 ---
 ---Doesn't touch Dependency Tree: that panel is a "look something up right now" tool by design
 ---(see its own doc comment - always re-runs `mvn dependency:tree` fresh on open, no cache), not
----part of the persistent IDE-like layout the other three panels form together.
+---part of the persistent IDE-like layout the other panels form together.
 ---@param root string
 function M.reset_layout(root)
   local was_tree_open = project_tree.is_open()
   local was_maven_open = maven_panel.is_open()
   local was_session_open = session_manager_ui.is_open()
+  local was_toolbar_open = toolbar.is_open()
 
   project_tree.close()
   maven_panel.close()
   session_manager_ui.close()
+  toolbar.close()
 
-  if not (was_tree_open or was_maven_open or was_session_open) then
+  if not (was_tree_open or was_maven_open or was_session_open or was_toolbar_open) then
     vim.notify("java-debug-model: không có panel nào đang mở để sắp xếp lại.", vim.log.levels.INFO)
     return
   end
 
-  local function reopen_session_then_maven(project)
+  local function reopen_rest(project)
     if was_session_open then session_manager_ui.open() end
     if was_maven_open and project then maven_panel.open(root, project) end
+    if was_toolbar_open then toolbar.open(root) end
   end
 
   if was_tree_open or was_maven_open then
     M.get_project(root, function(project)
       if project and was_tree_open then project_tree.open(root, project) end
-      reopen_session_then_maven(project)
+      reopen_rest(project)
     end)
   else
-    reopen_session_then_maven(nil)
+    reopen_rest(nil)
   end
 end
 
@@ -304,6 +380,16 @@ function M.reload(root)
     jdtls_bridge.update_projects_configuration(pom_paths)
     vim.notify("java-debug-model: model reloaded (" .. #project.modules .. " modules)", vim.log.levels.INFO)
   end)
+end
+
+---Synchronous, cache-only lookup - returns whatever Project is ALREADY resolved for `root`, or
+---nil, WITHOUT kicking off a fresh (async, `mvn`-shelling) resolve the way M.get_project does.
+---For callers that run far too often to afford that, e.g. ui/statusline.lua's own breadcrumb -
+---re-evaluated on basically every redraw via a `'statusline'` expression.
+---@param root string
+---@return table|nil Project
+function M.get_cached_project(root)
+  return projects_by_root[root]
 end
 
 -- `print(vim.inspect(project))` on a real multi-module project can dump
@@ -495,6 +581,23 @@ function M.dependency_tree(root)
   end)
 end
 
+---Opens the nui.nvim-based Config Panel (IntelliJ "Edit Configurations" dialog equivalent) -
+---the left list + right form, both editable in place, over the SAME config_store data
+---config_form.lua's :JavaDebugConfigAdd/:JavaDebugConfigEdit already use.
+---@param root string
+function M.config_panel_open(root)
+  M.get_project(root, function(project)
+    if project then config_panel.open(root, project) end
+  end)
+end
+
+---Opens (or toggles) the IntelliJ-style toolbar (Run/Debug buttons + active-config selector) for
+---`root`.
+---@param root string
+function M.toolbar_toggle(root)
+  toolbar.toggle(root)
+end
+
 function M.debug_config_run(root, name)
   local cfg = config_store.get(root, name)
   if not cfg then
@@ -533,6 +636,42 @@ function M.setup(opts)
   M.opts = vim.tbl_deep_extend("force", M.opts, opts or {})
   session.setup_listeners()
 
+  -- "tôi test mở file vẫn còn mở vào các panel chức năng" (opening a file still sometimes lands
+  -- inside a panel) - safe_edit_win alone only protects THIS plugin's own `:edit` call sites;
+  -- this catches every OTHER way a real file buffer can end up in a panel window too (gf, gd, a
+  -- quickfix jump, the user running `:e` while focus happens to be on a panel) and relocates it.
+  -- See ui/panel_registry.lua's own M.install_guard comment for the full mechanism.
+  local panel_registry = require("java-debug-model.ui.panel_registry")
+  panel_registry.install_guard()
+  -- "chỉ có panel editor mới có thanh bar ở cuối panel" (only the editor panel should have a
+  -- status bar at its bottom) - keeps every OTHER panel's own statusline blank even against a
+  -- statusline plugin (lualine.nvim, ...) re-asserting its own text on every WinEnter/BufEnter.
+  -- See ui/panel_registry.lua's own M.install_statusline_guard comment for the full mechanism.
+  panel_registry.install_statusline_guard()
+
+  if M.opts.main_gutter_enabled then
+    main_gutter.setup()
+  end
+
+  -- Turns the IntelliJ-style tab row on/off for the whole session - it's independent of
+  -- ui/toolbar.lua's own bar now (attaches straight to editor windows via 'winbar'), so it's
+  -- enabled here directly rather than being read lazily from inside toolbar.lua's render().
+  if M.opts.bufferline_enabled then
+    bufferline.enable()
+  else
+    bufferline.disable()
+  end
+
+  -- Turns the IntelliJ-style single global status bar on/off - see ui/statusline.lua's own doc
+  -- comment for why `laststatus = 3` here is also what fixes every panel's own per-window
+  -- statusline row disappearing for good (there's no per-window statusline left to hijack once
+  -- Neovim is in global-statusline mode).
+  if M.opts.statusline_enabled then
+    statusline.enable()
+  else
+    statusline.disable()
+  end
+
   -- Cài Mason packages (jdtls/java-debug-adapter/java-test) + wire spring-boot.nvim nếu có -
   -- gộp vào đây để "cấu hình java-debug-model" một chỗ là đủ chạy hết tính năng Java, không
   -- cần người dùng tự lặp lại phần này ở plugins/lsp.lua hay tự viết config spring-boot.nvim
@@ -562,11 +701,79 @@ function M.setup(opts)
     callback = function() resolve_root_from_cwd() end,
   })
 
+  if M.opts.restore_layout_on_start then
+    local root_at_start = last_root
+    if root_at_start then layout_state.restore(root_at_start) end
+    -- Second chance for when cwd alone didn't resolve a root yet (e.g. Neovim opened from
+    -- outside the project, a .java file opened later) - layout_state.restore is itself a once-
+    -- per-root no-op on a second call, so this never double-restores when the cwd path above
+    -- already handled it.
+    vim.api.nvim_create_autocmd("FileType", {
+      pattern = "java",
+      callback = function(args)
+        local root = find_root(args.buf)
+        if root then layout_state.restore(root) end
+      end,
+    })
+    vim.api.nvim_create_autocmd("VimLeavePre", {
+      callback = function()
+        if last_root then layout_state.save(last_root) end
+      end,
+    })
+  end
+
   if M.opts.auto_attach then
+    -- "mở neovim là chạy như vào file java, không phải mở file java nữa" (opening Neovim should
+    -- already act like being in a java file, not require actually opening one first) - jdtls's
+    -- own start_or_attach (jdtls_launcher.lua) never actually checks filetype anywhere in its own
+    -- body, it purely resolves a root from whatever bufnr it's given (falling back through
+    -- last_root/cwd for a buffer with no real file at all, e.g. the initial [No Name] buffer) -
+    -- so there's nothing stopping it from running immediately at startup instead of waiting on a
+    -- FileType java event. Only fires here if cwd already resolves a Maven root (found ==
+    -- root_at_start below); the FileType autocmd right after remains as the fallback for when it
+    -- doesn't (Neovim opened from outside the project, cd'd in later, or a .java file opened
+    -- directly without cwd ever matching).
+    if last_root then
+      M.start_or_attach(vim.api.nvim_get_current_buf())
+    end
     vim.api.nvim_create_autocmd("FileType", {
       pattern = "java",
       callback = function(args) M.start_or_attach(args.buf) end,
     })
+  end
+
+  if M.opts.toolbar_auto_open then
+    local opened_for_root = {}
+    vim.api.nvim_create_autocmd("FileType", {
+      pattern = "java",
+      callback = function(args)
+        local root = find_root(args.buf)
+        if root and not opened_for_root[root] then
+          opened_for_root[root] = true
+          toolbar.open(root)
+        end
+      end,
+    })
+  end
+
+  if M.opts.run_debug_keymaps then
+    local keys = M.opts.run_debug_keymaps
+    if keys.run then
+      vim.keymap.set("n", keys.run, function() toolbar.run_active(find_root(0), true) end,
+        { desc = "Java: run active config" })
+    end
+    if keys.debug then
+      vim.keymap.set("n", keys.debug, function() toolbar.run_active(find_root(0), false) end,
+        { desc = "Java: debug active config" })
+    end
+    if keys.select then
+      vim.keymap.set("n", keys.select, function() toolbar.select_config(find_root(0)) end,
+        { desc = "Java: select active Run/Debug Configuration" })
+    end
+    if keys.select_module then
+      vim.keymap.set("n", keys.select_module, function() toolbar.select_module(find_root(0)) end,
+        { desc = "Java: open module selector" })
+    end
   end
 end
 
@@ -592,6 +799,13 @@ M.test = test
 M.config_store = config_store
 M.dependency_tree_ui = dependency_tree_ui
 M.session_manager_ui = session_manager_ui
+M.active_config = active_config
+M.config_panel = config_panel
+M.toolbar = toolbar
+M.bufferline = bufferline
+M.statusline_ui = statusline
+M.main_gutter = main_gutter
+M.layout_state = layout_state
 
 ---Short "⏳ ..." string while a Maven resolve, a Maven Lifecycle run, or a
 ---debug launch is in flight, empty otherwise - wire into a statusline

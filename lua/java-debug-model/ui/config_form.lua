@@ -5,6 +5,30 @@ local config_store = require("java-debug-model.config_store")
 
 local M = {}
 
+---Interactive JDK picker for a DebugConfig's `jdk_path` (reuses lua/jdk.lua's disk discovery -
+---same JDKs offered by jdtls_launcher's <leader>jv and maven_jdk.lua's per-root Maven JDK). Falls
+---straight through to `cb(existing_jdk_path)` if lua/jdk.lua isn't available or finds nothing,
+---rather than blocking config save on an unrelated module being missing.
+---@param existing_jdk_path string|nil
+---@param cb fun(jdk_path: string|nil)
+local function pick_jdk(existing_jdk_path, cb)
+  local ok_jdk, jdk = pcall(require, "jdk")
+  if not ok_jdk then cb(existing_jdk_path) return end
+  local paths = jdk.list()
+  if #paths == 0 then cb(existing_jdk_path) return end
+
+  local items = { { path = nil, label = "(mặc định - dùng JAVA_HOME/PATH hiện tại)" } }
+  for _, path in ipairs(paths) do
+    table.insert(items, { path = path, label = jdk.ee_name(jdk.major_version(path)) .. " :: " .. path })
+  end
+  vim.ui.select(items, {
+    prompt = "Java version để debug config này:",
+    format_item = function(item) return item.label end,
+  }, function(choice)
+    cb(choice and choice.path or nil)
+  end)
+end
+
 local function parse_env_vars(text)
   local env = {}
   if not text or text == "" then return env end
@@ -100,18 +124,21 @@ function M.open(root, project, opts)
                     default = existing and table.concat(existing.maven_profiles, ",") or "",
                   }, function(profiles_str)
                     if profiles_str == nil then cancelled() return end
-                    local config = {
-                      name = name,
-                      module_path = module.path,
-                      main_class = main_class,
-                      vm_args = vm_args or "",
-                      program_args = program_args or "",
-                      env_vars = parse_env_vars(env_str),
-                      working_directory = (cwd ~= "" and cwd) or module.content_root,
-                      maven_profiles = profiles_str and profiles_str ~= "" and vim.split(profiles_str, ",") or {},
-                    }
-                    config_store.add(root, config)
-                    vim.notify("java-debug-model: saved debug config '" .. name .. "'", vim.log.levels.INFO)
+                    pick_jdk(existing and existing.jdk_path or nil, function(jdk_path)
+                      local config = {
+                        name = name,
+                        module_path = module.path,
+                        main_class = main_class,
+                        vm_args = vm_args or "",
+                        program_args = program_args or "",
+                        env_vars = parse_env_vars(env_str),
+                        working_directory = (cwd ~= "" and cwd) or module.content_root,
+                        maven_profiles = profiles_str and profiles_str ~= "" and vim.split(profiles_str, ",") or {},
+                        jdk_path = jdk_path,
+                      }
+                      config_store.add(root, config)
+                      vim.notify("java-debug-model: saved debug config '" .. name .. "'", vim.log.levels.INFO)
+                    end)
                   end)
                 end)
               end)

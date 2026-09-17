@@ -158,3 +158,43 @@ command("JavaProjectTreeLocate", function()
 end, {})
 
 command("JavaLayoutReset", function() jdm().reset_layout(current_root()) end, {})
+
+command("JavaConfigPanel", function()
+  if jdm().config_panel.is_open() then
+    jdm().config_panel.close()
+    return
+  end
+  jdm().config_panel_open(current_root())
+end, {})
+
+command("JavaToolbar", function() jdm().toolbar_toggle(current_root()) end, {})
+command("JavaToolbarRun", function() jdm().toolbar.run_active(current_root(), true) end, {})
+command("JavaToolbarDebug", function() jdm().toolbar.run_active(current_root(), false) end, {})
+command("JavaConfigSelect", function(args)
+  local root = current_root()
+  if args.args and args.args ~= "" then
+    jdm().active_config.set(root, args.args)
+    jdm().toolbar.refresh()
+    vim.notify("java-debug-model: active config -> " .. args.args, vim.log.levels.INFO)
+  else
+    vim.ui.select(config_names(), { prompt = "Active Run/Debug Configuration:" }, function(name)
+      if not name then return end
+      jdm().active_config.set(root, name)
+      jdm().toolbar.refresh()
+      vim.notify("java-debug-model: active config -> " .. name, vim.log.levels.INFO)
+    end)
+  end
+end, { nargs = "?", complete = config_names })
+
+command("JavaDebugMainUnderCursor", function()
+  jdm().main_gutter.run_under_cursor(vim.api.nvim_get_current_buf())
+end, {})
+
+command("JavaLayoutSave", function()
+  local root = current_root()
+  jdm().layout_state.save(root)
+  vim.notify("java-debug-model: đã lưu trạng thái panel/file cho " .. root, vim.log.levels.INFO)
+end, {})
+command("JavaLayoutRestore", function()
+  jdm().layout_state.restore(current_root(), true)
+end, {})

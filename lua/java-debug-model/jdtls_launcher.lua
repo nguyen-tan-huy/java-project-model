@@ -432,7 +432,21 @@ function M.start_or_attach(bufnr, opts)
       end
       config.init_options.workspaceFolders = uris
     end
-    jdtls.start_or_attach(config)
+    -- nvim-jdtls's OWN start_or_attach (jdtls/setup.lua) resolves the buffer to attach via
+    -- `start_opts.bufnr or api.nvim_get_current_buf()` when no start_opts is given - and this
+    -- runs from an ASYNC callback (jdm.get_project's own mvn resolve can take seconds), so by
+    -- the time it fires, "whatever buffer happens to be current" is no longer necessarily the
+    -- SAME `bufnr` this whole M.start_or_attach call started from (confirmed for real: opts.
+    -- auto_attach's own immediate-at-setup() call, or the user just navigating around while mvn
+    -- resolves, can leave focus on one of THIS plugin's own nofile panel windows by then).
+    -- nvim-jdtls ALSO silently no-ops (`if not vim.startswith(uri, "file://") then return end`)
+    -- for a buffer with no real file:// URI - exactly what a panel buffer is - so without pinning
+    -- start_opts.bufnr explicitly to the ORIGINAL bufnr, jdtls could silently never actually
+    -- start at all while this module's own `java_debug_model_jdtls_started` guard is already set,
+    -- leaving the status HUD stuck at "starting" forever with no retry possible.
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      jdtls.start_or_attach(config, nil, { bufnr = bufnr })
+    end
   end)
 end
 

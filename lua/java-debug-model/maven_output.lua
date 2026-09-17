@@ -27,7 +27,26 @@ function M.run_in_terminal(cmd, cwd, opts)
   local title = opts.title or table.concat(cmd, " ")
 
   local existing = bufs_by_title[title]
-  if existing and vim.api.nvim_buf_is_valid(existing) then
+  -- A cached bufnr from a PREVIOUS run of this exact title is only trustworthy if it's STILL
+  -- actually that terminal buffer. `nvim_buf_is_valid(existing)` alone can't tell that apart from
+  -- "some unrelated buffer - even a real FILE - that happened to get this exact number reassigned
+  -- later": Neovim freely reuses a buffer NUMBER once its old buffer is fully wiped (e.g. the user
+  -- closed that terminal tab via ui/bufferline.lua's own click-to-close, or plain `:bwipeout`).
+  -- Confirmed for real: re-running the same Maven job picked up a recycled bufnr that by then
+  -- belonged to an open pom.xml buffer - renamed THAT (corrupting the real file buffer's own
+  -- identity) and left a stray little window sitting in the layout, scrolled to wherever pom.xml's
+  -- cursor happened to be ("bị hiển thị lỗi gì như trong hình" - a screenshot showed exactly this:
+  -- a small window showing a random `<order-core.version>` line from pom.xml). Checking `buftype`
+  -- AND the marker this same function sets on every real terminal buffer of its own
+  -- (`java_debug_model_maven_title`, set below) is what actually distinguishes "still our
+  -- terminal" from "reused for something else" - `existing = nil` falls through to the plain
+  -- fresh-terminal path below instead of touching whatever that buffer really is now.
+  if existing and not (vim.api.nvim_buf_is_valid(existing)
+      and vim.bo[existing].buftype == "terminal"
+      and vim.b[existing].java_debug_model_maven_title == title) then
+    existing = nil
+  end
+  if existing then
     local win = vim.fn.bufwinid(existing)
     if win == -1 then
       vim.cmd("botright split")

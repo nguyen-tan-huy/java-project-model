@@ -302,8 +302,13 @@ function M.rerun_failed(variant)
   if not ok_jdtls then return end
 
   local jdm = require("java-debug-model")
+  local panel_registry = require("java-debug-model.ui.panel_registry")
   for _, failure in ipairs(failed) do
     if failure.file then
+      -- `:edit` always targets the CURRENT window - "rerun failed" is commonly triggered from
+      -- ui/test_results.lua's own panel, so without this the file would land INSIDE it instead
+      -- of a real editor window (same class of bug layout_state.lua's own restore() had).
+      vim.api.nvim_set_current_win(panel_registry.safe_edit_win())
       vim.cmd("edit " .. vim.fn.fnameescape(failure.file))
       vim.api.nvim_win_set_cursor(0, { failure.line or 1, 0 })
       local bufnr = vim.api.nvim_get_current_buf()

@@ -264,12 +264,17 @@ function M.open(root, project)
   wo.cursorline = true
   wo.winfixwidth = true
 
-  panel_registry.register(winid)
+  panel_registry.register(winid, state.bufnr)
   vim.api.nvim_create_autocmd("WinClosed", {
     pattern = tostring(winid),
     once = true,
     callback = function() panel_registry.unregister(winid) end,
   })
+
+  -- Re-pin the toolbar to full width if it was opened before this panel - see
+  -- ui/toolbar.lua's M.redock comment (same reasoning as project_tree.lua's own call to it).
+  local ok_toolbar, toolbar = pcall(require, "java-debug-model.ui.toolbar")
+  if ok_toolbar then toolbar.redock() end
 
   render()
 end

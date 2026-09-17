@@ -11,7 +11,7 @@ local M = {}
 ---saved config afterwards must not affect an already-running session).
 ---@param project table Project
 ---@param config table DebugConfig (see config_store.lua)
----@param opts table?  { open_j9_java_exec?: string }
+---@param opts table?  { open_j9_java_exec?: string, no_debug?: boolean }
 ---@return table dap config
 function M.build_launch_config(project, config, opts)
   opts = opts or {}
@@ -50,13 +50,25 @@ function M.build_launch_config(project, config, opts)
     cwd = snapshot.working_directory,
   }
 
-  -- OpenJ9 debug-target JVM: scoped to the DEBUG TARGET only, not jdtls's own
-  -- JVM. A drop-in swap over the default HotSpot resolved from JAVA_HOME/PATH
-  -- - JDWP support is unaffected, so debugging works identically, while
-  -- lowering the target JVM's memory footprint (useful with several
-  -- concurrent debug sessions).
-  if opts.open_j9_java_exec then
+  -- Which `java` binary launches the DEBUG TARGET (never jdtls's own JVM). Per-config
+  -- `jdk_path` (picked in ui/config_form.lua from lua/jdk.lua's disk discovery) wins when set,
+  -- since it's the more specific choice - falls back to opts.open_j9_java_exec (setup()-wide
+  -- default, e.g. an OpenJ9 install) otherwise. Either way this is a drop-in `javaExec` swap:
+  -- JDWP support is unaffected, so debugging works identically against any JDK/JVM vendor.
+  if snapshot.jdk_path then
+    dap_config.javaExec = snapshot.jdk_path .. "/bin/java"
+  elseif opts.open_j9_java_exec then
     dap_config.javaExec = opts.open_j9_java_exec
+  end
+
+  -- "Run" vs "Debug" (toolbar's two buttons, or <leader>jr/<leader>jd) - same launch config either way, only this one
+  -- DAP-level flag differs. java-debug honors `noDebug` the same way VS Code's own launch configs
+  -- do: the JVM still starts through the SAME adapter/session machinery (so session.lua's
+  -- tracking/terminate-by-marker below is unaffected), it just never installs breakpoints or
+  -- stops on them - mirrors test.lua's own `variant == "run" and { noDebug = true }` convention
+  -- for the test runner's Run vs Debug distinction.
+  if opts.no_debug then
+    dap_config.noDebug = true
   end
 
   return dap_config
@@ -83,6 +95,23 @@ function M.launch(project, config, opts)
   local ok_dap, dap = pcall(require, "dap")
   if not ok_dap then
     vim.notify("java-debug-model: nvim-dap not found", vim.log.levels.ERROR)
+    return
+  end
+
+  -- `dap.adapters.java` is registered by nvim-jdtls's own `jdtls.setup_dap()` - called from THIS
+  -- plugin's jdtls_launcher.lua M.on_attach, which only ever runs once jdtls has actually
+  -- ATTACHED to a real .java buffer (java-debug-model ships no ftplugin/java.lua of its own - see
+  -- README's own note - so nothing forces that to happen just because a debug config gets run).
+  -- Launching without it reaches nvim-dap's own generic "Config references missing adapter
+  -- `java`. Available are: <whatever else you have>" error, which gives no hint about WHY - this
+  -- catches it here with an actionable message instead (confirmed for real: running a config from
+  -- the toolbar/global keymap/gutter while jdtls had never attached in this Neovim session hit
+  -- exactly that generic error).
+  if not dap.adapters.java then
+    vim.notify(
+      "java-debug-model: jdtls chưa attach (chưa sẵn sàng debug Java) - mở 1 file .java trong module "
+        .. config.module_path .. " rồi thử lại (jdtls cần attach ít nhất 1 lần để đăng ký debug adapter).",
+      vim.log.levels.ERROR)
     return
   end
 
@@ -134,6 +163,13 @@ function M.launch(project, config, opts)
   dap.run(dap_config, {
     before = function(conf) return conf end,
   })
+
+  -- Returned so callers (e.g. ui/toolbar.lua's M.run_active) can focus THIS specific launch in
+  -- ui/session_manager.lua's panel (M.focus_entry(id)) instead of just opening the panel and
+  -- leaving the user to find the right row themselves - session.register() above already ran
+  -- synchronously, so the id is available immediately, well before the session itself finishes
+  -- starting (mark_started happens later, asynchronously, once poll_for_new_session resolves).
+  return session_id
 end
 
 return M

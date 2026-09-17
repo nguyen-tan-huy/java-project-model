@@ -121,18 +121,31 @@ end
 ---the shared DAP REPL buffer if neither produced anything (yet).
 ---@param entry SessionEntry
 ---@return integer|nil bufnr
+---A cached bufnr in dap_status.term_bufs is only trustworthy if it's STILL actually a terminal -
+---`nvim_buf_is_valid()` alone can't tell that apart from "some unrelated buffer (even a real FILE)
+---that happened to get this exact number reassigned later", since Neovim freely reuses a buffer
+---NUMBER once its old buffer is fully wiped (e.g. that terminal tab closed via ui/bufferline.lua's
+---own click-to-close). See maven_output.lua's own M.run_in_terminal comment for the confirmed
+---real-world repro of this exact class of bug (a screenshot showing a random pom.xml line instead
+---of the expected log).
+---@param buf integer|nil
+---@return boolean
+local function is_live_terminal(buf)
+  return buf ~= nil and vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].buftype == "terminal"
+end
+
 local function log_buf_for(entry)
   local ok_status, dap_status = pcall(require, "dap_status")
   if ok_status then
     local buf = dap_status.term_bufs[dap_status_key_for(entry)]
-    if buf and vim.api.nvim_buf_is_valid(buf) then
+    if is_live_terminal(buf) then
       return buf
     end
     -- entry.name and the real launch-config name can differ (see dap_status_key_for) - try both,
     -- in case the OutputEvent path (keyed by entry.name) captured something while the
     -- runInTerminal path (keyed by the launch config's own name) didn't, or vice versa.
     buf = dap_status.term_bufs[entry.name]
-    if buf and vim.api.nvim_buf_is_valid(buf) then
+    if is_live_terminal(buf) then
       return buf
     end
   end
@@ -360,6 +373,14 @@ local function add_new()
   vim.defer_fn(reload_configs, 300) -- config_form.open's own save happens async (get_project first)
 end
 
+---Opens ui/config_panel.lua's "Edit Configurations" panel (the nui.nvim list+form UI, same one
+---the toolbar's "Edit Configurations..." menu entry opens), pre-selected to THIS row's config -
+---not config_form.lua's older sequential vim.ui.input prompt chain (debug_config_edit), which
+---'e' used to open here. Setting it as the active config first is what makes config_panel.lua
+---land on the right row (M.open() there already resolves its initial selection from
+---active_config.get(root)) - a deliberate side effect, not just a means to an end: editing a
+---profile from here is a reasonable moment to also make it the one the toolbar's Run/Debug acts
+---on next.
 local function edit_selected()
   local row = row_at_cursor()
   if not row or not state.root then return end
@@ -367,7 +388,9 @@ local function edit_selected()
     vim.notify("java-debug-model: test tạm không có config để sửa.", vim.log.levels.WARN)
     return
   end
-  require("java-debug-model").debug_config_edit(state.root, row.config.name)
+  local jdm = require("java-debug-model")
+  jdm.active_config.set(state.root, row.config.name)
+  jdm.config_panel_open(state.root)
   vim.defer_fn(reload_configs, 300)
 end
 
@@ -394,15 +417,42 @@ end
 ---Services-style panel pops up already focused on the test that just started, log streaming
 ---live - no separate "now go find it in the list yourself" step.
 ---@param id integer  session.SessionEntry.id
-function M.focus_entry(id)
-  M.open()
+---@param attempts_left integer?  internal - retry budget, see the comment below
+function M.focus_entry(id, attempts_left)
+  -- Only the FIRST call (attempts_left not yet supplied) actually opens/focuses the panel window -
+  -- a retry must NOT repeat that, or it would yank focus back to the panel every 500ms for up to
+  -- 3s even if the user has since clicked away to keep working while the app starts up.
+  -- `nvim_win_set_cursor`/render()'s own refresh below operate on `state.winid` directly and don't
+  -- need it to be the CURRENT window at all.
+  if attempts_left == nil then M.open() end
+  attempts_left = attempts_left or 6 -- ~3s at 500ms, matching typical Spring Boot startup lag
+  if not M.is_open() then return end -- closed by the user while a retry was still pending
+
   for lnum, row in pairs(state.line_map) do
     local entry = row_session(row)
     if entry and entry.id == id then
       pcall(vim.api.nvim_win_set_cursor, state.winid, { lnum, 0 })
       sync_log_to_cursor()
+      -- Reported for real: "khi chạy profile ... theo profile active thứ 2 trong danh sách, thì
+      -- focus vào không có hiện log, mà click vào profile trên lại có log" (running a profile that
+      -- ISN'T the first one in the list focuses it but shows no log - clicking the row again does
+      -- show it). This is called RIGHT AFTER dap.launch() returns - the debug adapter hasn't
+      -- actually spawned the debuggee's terminal (dap_status.term_bufs) yet at that instant, so
+      -- log_buf_for() inside sync_log_to_cursor() above finds nothing and falls back to the
+      -- placeholder; nothing re-syncs the pane again on its own once the real terminal DOES appear
+      -- a moment later UNLESS the cursor happens to move (re-triggering the CursorMoved autocmd) -
+      -- a manual click just does that by accident. Retrying this same focus a few times closes
+      -- that gap automatically instead of leaving the pane stuck on the placeholder.
+      if attempts_left > 0 and vim.api.nvim_win_get_buf(state.log_winid) == state.placeholder_bufnr then
+        vim.defer_fn(function() M.focus_entry(id, attempts_left - 1) end, 500)
+      end
       return
     end
+  end
+  -- The row itself wasn't found yet either (session/config bookkeeping still catching up right
+  -- after registration) - same retry budget covers this case too.
+  if attempts_left > 0 then
+    vim.defer_fn(function() M.focus_entry(id, attempts_left - 1) end, 500)
   end
 end
 
@@ -482,8 +532,14 @@ function M.open()
     wo.cursorline = true
     wo.winfixwidth = true
 
-    panel_registry.register(state.log_winid)
-    panel_registry.register(state.winid)
+    -- log_winid's OWN registered bufnr is just the initial placeholder - its legitimate content
+    -- swaps to a DIFFERENT session's log/dap-terminal buffer as the cursor moves (sync_log_to_cursor),
+    -- but those are always nofile/terminal buftypes, never a real listed file, so
+    -- panel_registry's guard never fires for that; only an actual file-buffer intruder would ever
+    -- trip it, and restoring to the placeholder in that rare case is an acceptable simplification
+    -- (self-heals the moment the cursor moves in the list again).
+    panel_registry.register(state.log_winid, vim.api.nvim_win_get_buf(state.log_winid))
+    panel_registry.register(state.winid, state.bufnr)
     vim.api.nvim_create_autocmd("WinClosed", {
       pattern = tostring(state.log_winid),
       once = true,
@@ -494,6 +550,11 @@ function M.open()
       once = true,
       callback = function() panel_registry.unregister(state.winid) end,
     })
+
+    -- Re-pin the toolbar to full width if it was opened before this panel - see
+    -- ui/toolbar.lua's M.redock comment (same reasoning as project_tree.lua's own call to it).
+    local ok_toolbar, toolbar = pcall(require, "java-debug-model.ui.toolbar")
+    if ok_toolbar then toolbar.redock() end
   end
 
   reload_configs()

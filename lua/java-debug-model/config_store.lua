@@ -12,6 +12,13 @@ local M = {}
 ---@field env_vars table<string, string>
 ---@field working_directory string
 ---@field maven_profiles string[]
+---@field jdk_path string|nil  JDK install dir to launch the DEBUGGEE JVM with (see lua/jdk.lua's
+---                             discovery) - nil means "no override", falls back to
+---                             opts.open_j9_java_exec (setup()-wide default) or plain JAVA_HOME/PATH
+---                             resolution. Independent from maven_jdk.lua's per-root Maven JDK and
+---                             from jdtls_launcher's <leader>jv Project SDK - this one is scoped to
+---                             just this one DebugConfig's launched process, so different configs in
+---                             the same project can debug against different JDKs.
 
 local function store_path(root)
   return root .. "/.nvim/java-debug-model/debug-configs.json"
@@ -122,6 +129,7 @@ function M.default_from_main_class(module, main_class)
     env_vars = {},
     working_directory = module.content_root,
     maven_profiles = {},
+    jdk_path = nil,
   }
 end
 

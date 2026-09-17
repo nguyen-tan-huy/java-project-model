@@ -14,7 +14,7 @@ local text = table.concat(lines, "\n")
 assert(text:find("Project"), "tree should show a Project root")
 assert(text:find("module%-a"), "tree should list module-a")
 assert(text:find("module%-b"), "tree should list module-b")
-assert(text:find("independent pom"), "module-b should be flagged as an independent pom")
+assert(text:find("%[independent%]"), "module-b should be flagged as an independent pom")
 
 -- expand module-a: find its line, toggle, check source roots appear (lazy load)
 local mod_a_line

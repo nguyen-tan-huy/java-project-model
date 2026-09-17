@@ -260,7 +260,7 @@ function M.open(module, opts)
     wo.wrap = false
     wo.cursorline = true
 
-    panel_registry.register(state.winid)
+    panel_registry.register(state.winid, state.bufnr)
     vim.api.nvim_create_autocmd("WinClosed", {
       pattern = tostring(state.winid),
       once = true,

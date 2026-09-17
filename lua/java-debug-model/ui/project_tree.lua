@@ -649,6 +649,21 @@ function M.open(root, project)
     vim.keymap.set("n", "d", delete_at_cursor, { buffer = state.bufnr, nowait = true, desc = "Xoá file/thư mục" })
     vim.keymap.set("n", "W", collapse_all, { buffer = state.bufnr, nowait = true, desc = "Thu gọn hết (Collapse All)" })
     vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = state.bufnr, nowait = true })
+    -- Chuột (an explicit ask: "UI java project tree cho phép dùng chuột") - click 1 phát trên 1
+    -- node làm ĐÚNG như <CR> (mở file, hoặc gập/mở thư mục nếu không phải file - xem
+    -- open_file_at_cursor's own toggle_at_cursor fallback).
+    --
+    -- `<LeftRelease>`, KHÔNG PHẢI `<LeftMouse>` - kể cả buffer-local (chỉ gắn vào bufnr của CHÍNH
+    -- cây này, không phải global) vẫn PHÁ việc kéo-resize border của cửa sổ này, xác nhận thật:
+    -- "lại không resize các panel được nữa rồi". `<LeftMouse>` là sự kiện NHẤN chuột - đúng lúc
+    -- Neovim cần nhận diện "cú nhấn này rơi đúng vào 1 border" để bắt đầu kéo-resize, nên BẤT KỲ
+    -- mapping nào cho `<LeftMouse>` (dù buffer-local) cũng chen vào giữa và làm hỏng bước nhận diện
+    -- đó cho cửa sổ liên quan. `<LeftRelease>` (lúc THẢ chuột) không dính gì tới bước bắt-đầu-kéo
+    -- đó cả - việc kéo-resize (nếu có) đã tự chạy xong bằng `<LeftMouse>`+`<LeftDrag>` nội bộ của
+    -- Neovim trước khi `<LeftRelease>` được gửi đi, còn 1 cú click thường (không kéo) thì
+    -- press+release rơi cùng 1 chỗ nên hành vi "click mở file" vẫn y hệt - đây là cách nvim-tree/
+    -- neo-tree cùng né lỗi này.
+    vim.keymap.set("n", "<LeftRelease>", open_file_at_cursor, { buffer = state.bufnr, nowait = true })
 
     -- Cập nhật nhóm "Open Editors" ngay khi buffer nào đó mở/đóng - chỉ đăng ký 1 LẦN (nằm
     -- trong khối "tạo bufnr lần đầu" này) vì buffer list là trạng thái toàn cục, không gắn với
@@ -689,12 +704,19 @@ function M.open(root, project)
     wo.cursorline = true
     wo.winfixwidth = true
 
-    panel_registry.register(state.tree_winid)
+    panel_registry.register(state.tree_winid, state.bufnr)
     vim.api.nvim_create_autocmd("WinClosed", {
       pattern = tostring(state.tree_winid),
       once = true,
       callback = function() panel_registry.unregister(state.tree_winid) end,
     })
+
+    -- `topleft 40vsplit` above operates at the whole-tabpage level, same as ui/toolbar.lua's own
+    -- `wincmd K` docking - opening this AFTER the toolbar would otherwise shrink the toolbar's row
+    -- down to whatever's left of this new column instead of spanning full width (see
+    -- toolbar.lua's own M.redock comment for the confirmed repro). No-op if the toolbar isn't open.
+    local ok_toolbar, toolbar = pcall(require, "java-debug-model.ui.toolbar")
+    if ok_toolbar then toolbar.redock() end
   end
   render()
 end
@@ -731,6 +753,23 @@ function M.refresh(project)
   end
 end
 
+---Shared tail end of M.locate/M.locate_module: renders the tree then scrolls/moves the cursor to
+---`node`'s own line - extracted so both entry points (one keyed by an open buffer's file path, the
+---other keyed directly by a Module) share the exact same "find the line, zz it" behavior instead
+---of drifting apart if one gets tweaked later.
+---@param node table TreeNode
+local function focus_node(node)
+  render()
+  for lnum, n in pairs(state.line_map) do
+    if n == node then
+      vim.api.nvim_set_current_win(state.tree_winid)
+      vim.api.nvim_win_set_cursor(state.tree_winid, { lnum, 0 })
+      vim.cmd("normal! zz")
+      break
+    end
+  end
+end
+
 ---Mở (nếu chưa mở) cây project rồi cuộn/focus tới đúng vị trí thật của `bufnr` trong cây module/
 ---source root - giống nút "Locate/Select Opened File" của IntelliJ. KHÁC nhóm "Open Editors" ở
 ---đầu cây (nhóm đó chỉ liệt kê phẳng, không cho biết file nằm ở module/thư mục nào).
@@ -757,16 +796,32 @@ function M.locate(root, project, bufnr)
       vim.log.levels.WARN)
     return
   end
-  render()
+  focus_node(node)
+end
 
-  for lnum, n in pairs(state.line_map) do
-    if n == node then
-      vim.api.nvim_set_current_win(state.tree_winid)
-      vim.api.nvim_win_set_cursor(state.tree_winid, { lnum, 0 })
-      vim.cmd("normal! zz")
-      break
-    end
+---Mở (nếu chưa mở) cây project rồi cuộn/focus tới đúng node của MỘT MODULE cụ thể - hành động của
+---module-selector dropdown trên toolbar (ui/toolbar.lua), giống click vào module dropdown của
+---IntelliJ rồi nó cuộn tới module đó trong Project view. Khác M.locate ở chỗ không cần 1 buffer
+---đang mở - nhận thẳng Module, dùng `module.path` (== mod.path khi so trong locate_path_in_tree,
+---xem nhánh `target_path == mod.path` của hàm đó) để trả về đúng node "module", không lồng sâu hơn
+---vào file/thư mục con nào.
+---@param root string
+---@param project table Project
+---@param module table Module
+function M.locate_module(root, project, module)
+  if not M.is_open() or state.root ~= root then
+    M.open(root, project)
+  else
+    state.project = project
   end
+
+  local node = locate_path_in_tree(state.tree, state.project, module.path)
+  if not node then
+    vim.notify("java-debug-model: không tìm thấy module " .. module:ga() .. " trong project tree hiện tại.",
+      vim.log.levels.WARN)
+    return
+  end
+  focus_node(node)
 end
 
 return M
