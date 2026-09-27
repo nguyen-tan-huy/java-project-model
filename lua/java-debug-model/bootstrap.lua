@@ -22,16 +22,53 @@ local M = {}
 ---mason-registry works with reasonable defaults even without an explicit setup() call in
 ---practice, but calling it here removes the implicit "some other file already did this" assumption
 ---entirely - "install java-debug-model" alone is then really enough.
-function M.ensure_mason_packages()
+---@param on_bundles_installed fun()?  called once after java-debug-adapter/java-test got newly
+---installed this session - jdtls only loads bundles at startup, so a jdtls that is already
+---running needs a restart to pick them up (init.lua passes jdtls_launcher.restart_all).
+function M.ensure_mason_packages(on_bundles_installed)
   pcall(function() require("mason").setup() end)
   local ok_registry, registry = pcall(require, "mason-registry")
   if not ok_registry then return end
-  for _, name in ipairs({ "jdtls", "java-debug-adapter", "java-test" }) do
-    local ok_pkg, pkg = pcall(registry.get_package, name)
-    if ok_pkg and not pkg:is_installed() then
-      vim.notify("java-debug-model: đang cài " .. name .. " qua Mason...", vim.log.levels.INFO)
-      pkg:install()
+
+  local function install_missing()
+    local pending, bundle_installed = 0, false
+    local function finished(name, success)
+      if success then
+        vim.notify("java-debug-model: đã cài " .. name, vim.log.levels.INFO)
+        if name ~= "jdtls" then bundle_installed = true end
+      else
+        vim.notify("java-debug-model: cài " .. name .. " qua Mason thất bại - thử :MasonInstall " .. name,
+          vim.log.levels.WARN)
+      end
+      pending = pending - 1
+      if pending == 0 and bundle_installed and on_bundles_installed then on_bundles_installed() end
     end
+    for _, name in ipairs({ "jdtls", "java-debug-adapter", "java-test" }) do
+      local ok_pkg, pkg = pcall(registry.get_package, name)
+      if ok_pkg and not pkg:is_installed() and not pkg:is_installing() then
+        pending = pending + 1
+        vim.notify("java-debug-model: đang cài " .. name .. " qua Mason...", vim.log.levels.INFO)
+        local done = false
+        local function once(success)
+          if done then return end
+          done = true
+          vim.schedule(function() finished(name, success) end)
+        end
+        -- mason 2.x: install(opts, callback); 1.x: returns a handle emitting "closed" - both.
+        local handle = pkg:install({}, function(success) once(success) end)
+        if handle and handle.once then
+          pcall(handle.once, handle, "closed", function() once(pkg:is_installed()) end)
+        end
+      end
+    end
+  end
+
+  -- A FRESH Mason has no registry downloaded yet: get_package() fails ("Cannot find package")
+  -- until it's refreshed once - which silently skipped every install on a brand-new machine.
+  if pcall(registry.get_package, "java-test") then
+    install_missing()
+  else
+    registry.refresh(vim.schedule_wrap(function() install_missing() end))
   end
 end
 
@@ -48,11 +85,12 @@ function M.setup_spring_boot(opts)
   local ls_path = opts.ls_path or
       (vim.fn.stdpath("data") .. "/nvim-java/packages/spring-boot-tools/1.55.1/extension/language-server")
   if vim.fn.isdirectory(ls_path) ~= 1 then
-    vim.notify(
-      "java-debug-model: không thấy spring-boot-tools language-server tại " .. ls_path ..
-      " -> autocomplete application.yml/properties sẽ không hoạt động. Truyền " ..
-      "opts.spring_boot_ls_path vào setup() nếu install ở đường dẫn khác.",
-      vim.log.levels.WARN)
+    -- Optional extra on top of jdtls: only complain when the user pointed at a path explicitly
+    -- (then it's a real misconfiguration) - a fresh install must start without warnings.
+    if opts.ls_path then
+      vim.notify("java-debug-model: không thấy spring-boot-tools language-server tại " .. ls_path ..
+        " -> autocomplete application.yml/properties sẽ không hoạt động.", vim.log.levels.WARN)
+    end
     return
   end
 
@@ -117,6 +155,56 @@ function M.ensure_jdtls_prebuilt(opts)
       "java-debug-model: đã giải nén nhưng không thấy bin/jdtls tại " .. dest ..
       " - kiểm tra lại URL/cấu trúc file tar.gz (asset có nên có thư mục con bọc ngoài không?).",
       vim.log.levels.WARN)
+  end
+end
+
+-- ── Lombok ──────────────────────────────────────────────────────────────────────────────────
+
+-- Where ensure_lombok() downloads lombok.jar when no copy exists anywhere else on the machine.
+M.lombok_download_path = vim.fn.stdpath("data") .. "/java-debug-model/lombok.jar"
+M.lombok_url = "https://projectlombok.org/downloads/lombok.jar"
+
+---First lombok.jar found: next to the jdtls in use, Mason's jdtls package (ships one), the
+---nvim-java cache, this plugin's own download, or the newest one in ~/.m2. nil if none.
+---jdtls needs it as a -javaagent, otherwise every @Getter/@Data/@Builder project is a sea of
+---"method getX() is undefined" errors.
+---@param jdtls_path string?
+---@return string|nil
+function M.find_lombok(jdtls_path)
+  local data = vim.fn.stdpath("data")
+  -- Built with table.insert, NOT a literal with a possibly-nil first entry: ipairs stops at the
+  -- first nil, which silently skipped every candidate whenever jdtls_path wasn't given.
+  local candidates = {}
+  if jdtls_path then table.insert(candidates, jdtls_path .. "/lombok.jar") end
+  vim.list_extend(candidates, {
+    data .. "/mason/packages/jdtls/lombok.jar",
+    data .. "/nvim-java/packages/lombok/1.18.42/lombok-1.18.42.jar",
+    M.lombok_download_path,
+  })
+  for _, c in ipairs(candidates) do
+    if vim.fn.filereadable(c) == 1 then return c end
+  end
+  -- glob() with list=true (expand() on a wildcard returns ONE "\n"-joined string instead)
+  local m2 = vim.fn.glob(vim.fn.expand("~") .. "/.m2/repository/org/projectlombok/lombok/*/lombok-*.jar", false, true)
+  m2 = vim.tbl_filter(function(f) return not f:match("%-sources%.jar$") and not f:match("%-javadoc%.jar$") end, m2)
+  table.sort(m2, function(a, b)
+    local va, vb = a:match("/lombok/([^/]+)/"), b:match("/lombok/([^/]+)/")
+    return vim.version.lt(vim.version.parse(va) or "0", vim.version.parse(vb) or "0")
+  end)
+  return m2[#m2]
+end
+
+---Downloads lombok.jar once (blocking, first run only - same trade-off as ensure_jdtls_prebuilt)
+---when find_lombok() comes up empty.
+function M.ensure_lombok()
+  if M.find_lombok() then return end
+  if vim.fn.executable("curl") == 0 then return end
+  vim.fn.mkdir(vim.fs.dirname(M.lombok_download_path), "p")
+  vim.notify("java-debug-model: đang tải lombok.jar (lần đầu)...", vim.log.levels.INFO)
+  local out = vim.fn.system({ "curl", "-fsSL", M.lombok_url, "-o", M.lombok_download_path })
+  if vim.v.shell_error ~= 0 then
+    pcall(vim.fn.delete, M.lombok_download_path)
+    vim.notify("java-debug-model: tải lombok.jar thất bại - " .. vim.trim(out), vim.log.levels.WARN)
   end
 end
 

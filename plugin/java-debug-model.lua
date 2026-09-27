@@ -170,6 +170,10 @@ end, {})
 command("JavaToolbar", function() jdm().toolbar_toggle(current_root()) end, {})
 command("JavaToolbarRun", function() jdm().toolbar.run_active(current_root(), true) end, {})
 command("JavaToolbarDebug", function() jdm().toolbar.run_active(current_root(), false) end, {})
+command("JavaToolbarRestart", function() jdm().toolbar.restart_active(current_root()) end, {})
+command("JavaToolbarRestartDebug", function()
+  jdm().toolbar.restart_active(current_root(), { no_debug = false })
+end, {})
 command("JavaConfigSelect", function(args)
   local root = current_root()
   if args.args and args.args ~= "" then
@@ -190,6 +194,20 @@ command("JavaDebugMainUnderCursor", function()
   jdm().main_gutter.run_under_cursor(vim.api.nvim_get_current_buf())
 end, {})
 
+-- IntelliJ Ctrl+B/Ctrl+Alt+B parity - see lua/java-debug-model/nav.lua. The buffer-local
+-- keymaps (wired on jdtls attach) are the primary way to use these; these commands exist as a
+-- reliable fallback (e.g. from the command line, or a terminal that eats Ctrl+Alt combos).
+command("JavaGoToDeclaration", function() jdm().nav.go_to_declaration() end, {})
+command("JavaGoToImplementation", function() jdm().nav.go_to_implementations() end, {})
+command("JavaFindUsages", function() jdm().nav.show_usages() end, {})
+command("JavaTypeHierarchySuper", function() jdm().nav.type_hierarchy(vim.api.nvim_get_current_buf(), "supertypes") end, {})
+command("JavaTypeHierarchySub", function() jdm().nav.type_hierarchy(vim.api.nvim_get_current_buf(), "subtypes") end, {})
+
+-- JSF Facelets <-> backing bean navigation - see lua/java-debug-model/jsf/nav.lua.
+command("JavaJsfGoTo", function() jdm().jsf_nav.go_to_declaration_xhtml() end, {})
+command("JavaXhtmlUsages", function() jdm().jsf_nav.find_xhtml_usages() end, {})
+command("JavaJsfIndexReload", function() jdm().jsf_bean_index.reload(current_root()) end, {})
+
 command("JavaLayoutSave", function()
   local root = current_root()
   jdm().layout_state.save(root)
@@ -198,3 +216,13 @@ end, {})
 command("JavaLayoutRestore", function()
   jdm().layout_state.restore(current_root(), true)
 end, {})
+
+-- Zero-config: installing the plugin is enough - if nothing called setup() by the time the
+-- current startup/load step finishes (lazy.nvim runs a spec's config()/opts in the SAME tick it
+-- sources this file, init.lua-based managers call it even earlier), run it with the defaults.
+-- Opt out with `vim.g.java_debug_model_auto_setup = false` to call setup() later yourself.
+vim.schedule(function()
+  if vim.g.java_debug_model_auto_setup == false then return end
+  local m = jdm()
+  if not m._setup_called then m.setup({}) end
+end)

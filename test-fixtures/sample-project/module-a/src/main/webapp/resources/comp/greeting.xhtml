@@ -1,0 +1,8 @@
+<ui:component xmlns="http://www.w3.org/1999/xhtml"
+              xmlns:ui="jakarta.faces.facelets"
+              xmlns:cc="jakarta.faces.composite">
+    <cc:interface>
+        <cc:attribute name="who"/>
+    </cc:interface>
+    <cc:implementation>Hello, #{cc.attrs.who}</cc:implementation>
+</ui:component>

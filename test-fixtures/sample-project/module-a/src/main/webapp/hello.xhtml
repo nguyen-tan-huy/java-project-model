@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:h="jakarta.faces.html"
+      xmlns:ui="jakarta.faces.facelets"
+      xmlns:c="jakarta.tags.core"
+      xmlns:comp="jakarta.faces.composite/comp">
+<h:body>
+    <ui:include src="/WEB-INF/includes/header.xhtml"/>
+    <h:outputText value="#{helloBean.name}"/>
+    <h:commandButton value="Say hello" action="#{helloBean.sayHello()}"/>
+    <h:panelGroup rendered="#{helloBean.active}"/>
+    <comp:greeting who="#{helloBean.name}"/>
+
+    <!-- chained / inherited / bracket / index / library type -->
+    <h:outputText value="#{helloBean.address.city}"/>
+    <h:outputText value="#{helloBean.address.country.name}"/>
+    <h:outputText value="#{helloBean.getAddress().city}"/>
+    <h:outputText value="#{helloBean['name']}"/>
+    <h:outputText value="#{helloBean.items[0].label}"/>
+    <h:outputText value="#{helloBean.version}"/>
+    <h:outputText value="#{helloBean.name.bytes}"/>
+
+    <!-- page variables -->
+    <ui:repeat var="item" value="#{helloBean.items}">
+        <h:outputText value="#{item.label}"/>
+    </ui:repeat>
+    <c:set var="addr" value="#{helloBean.address}"/>
+    <h:outputText value="#{addr.country.name}"/>
+
+    <!-- tag / expression split over several lines -->
+    <ui:include
+        src="/WEB-INF/includes/header.xhtml"/>
+    <h:outputText
+        value="#{helloBean.address
+                  .country}"/>
+    <h:outputText value="#{helloBean.address.zip}"/>
+</h:body>
+</html>

@@ -35,74 +35,64 @@ are Maven's job, never a hand-rolled parser's.
 
 ## Requirements
 
-- Neovim >= 0.10
-- [nvim-jdtls](https://github.com/mfussenegger/nvim-jdtls)
-- [nvim-dap](https://github.com/mfussenegger/nvim-dap)
-- [nvim-dap-ui](https://github.com/rcarriga/nvim-dap-ui)
-- Maven on `PATH` (or a `./mvnw` wrapper in the project root)
-- The `java-debug` and `java-test` jdtls bundle jars (e.g. via Mason's
-  `java-debug-adapter` and `java-test` packages)
-- [nui.nvim](https://github.com/MunifTanjim/nui.nvim) - optional, only needed for the
-  IntelliJ-style Config Panel (`:JavaConfigPanel`) and toolbar (`:JavaToolbar`). Every other
-  feature, including `:JavaDebugConfigAdd`'s plain prompt-based form, works without it.
+- Neovim >= 0.10 (0.11+ for completion without a completion plugin)
+- JDK 21+ and Maven on `PATH` (or a `./mvnw` wrapper in the project root)
+- `curl` + `tar` for the one-time jdtls / lombok download
 
-## Installation (lazy.nvim)
+Plugin dependencies and the jdtls / java-debug / java-test bundles are installed automatically
+(see Installation) - `:checkhealth java-debug-model` verifies all of it.
+
+## Installation
+
+Requirements on the machine: **JDK 21+** (jdtls itself runs on it - your projects can still
+target older Java) and **Maven** (or a `mvnw` in the project). Everything else is automatic.
+
+### lazy.nvim - one line
+
+```lua
+{ "nguyen-tan-huy/java-project-model" }
+```
+
+That's the whole spec. Open Neovim inside a Maven project and it works like IntelliJ:
+
+- dependencies (nvim-jdtls, nvim-dap, nvim-dap-ui, nvim-nio, nui.nvim, mason.nvim,
+  spring-boot.nvim) come from the plugin's own `lazy.lua`
+- `setup()` runs by itself with the defaults
+- the patched jdtls is downloaded once; java-debug-adapter + java-test are installed through
+  Mason, and jdtls restarts on its own to pick them up; `lombok.jar` is found (Mason, `~/.m2`)
+  or downloaded
+- jdtls starts as soon as Neovim opens in a Maven project (`auto_attach`)
+- code completion works even without a completion plugin (Neovim's own, popup while typing,
+  `<C-Space>`/`<CR>`); with nvim-cmp / blink.cmp it simply shows up there
+- JSF `.xhtml` files get Ctrl+B navigation and EL completion
+
+Something missing? `:checkhealth java-debug-model` lists every requirement with the fix.
+
+### Changing options
+
+Only when you want something different from the defaults:
 
 ```lua
 {
-  "nguyen-tan-huy/java-debug-model",
-  dependencies = {
-    "mfussenegger/nvim-jdtls",
-    "mfussenegger/nvim-dap",
-    "rcarriga/nvim-dap-ui",
-    "MunifTanjim/nui.nvim", -- optional: powers :JavaConfigPanel and :JavaToolbar
+  "nguyen-tan-huy/java-project-model",
+  opts = {
+    active_profiles = { "dev" },          -- Maven profiles for every resolve
+    -- open_j9_java_exec = "/path/to/openj9/bin/java",
+    run_debug_keymaps = { run = "<leader>jr", debug = "<leader>jd" },
+    native_completion = "auto",           -- true / false to force on / off
+    bufferline_enabled = true,
+    statusline_enabled = true,
+    jsf_nav_enabled = true,
+    jsf_completion_enabled = true,
   },
-  config = function()
-    require("java-debug-model").setup({
-      -- Absolute paths/globs to the java-debug and java-test bundle jars,
-      -- e.g. from Mason:
-      jdtls_bundle_globs = {
-        vim.fn.stdpath("data") .. "/mason/packages/java-debug-adapter/extension/server/com.microsoft.java.debug.plugin-*.jar",
-        vim.fn.stdpath("data") .. "/mason/packages/java-test/extension/server/*.jar",
-      },
-      -- jdtls launch config merged into every start_or_attach() call
-      -- (cmd, capabilities, on_attach, settings, etc. - see :h jdtls.start_or_attach)
-      jdtls_config = {
-        cmd = { "jdtls" },
-      },
-      active_profiles = {},       -- Maven profiles applied to every resolve
-      -- open_j9_java_exec = "/path/to/openj9/bin/java",  -- optional, debug target only
-      auto_attach = false,          -- true to attach jdtls immediately if cwd already resolves
-                                     -- a Maven root (no need to open a .java file first), plus
-                                     -- a FileType java autocmd as a fallback for when it doesn't
-      bufferline_enabled = true,    -- adds an open-buffer tab-list row to the toolbar's own
-                                     -- bar (see below) - plain text, no Config name repeated
-                                     -- there. Set to false to drop that row, e.g. if you run a
-                                     -- separate bufferline plugin instead.
-      toolbar_auto_open = true,     -- open the toolbar - a single docked bar with "Config:
-                                     -- <name>" on its own (taller) row, plus the tab-list row
-                                     -- right below it when bufferline_enabled - on the first
-                                     -- .java buffer per root; it's a real docked window, so it
-                                     -- does NOT reopen itself across a restart on its own
-                                     -- otherwise
-      restore_layout_on_start = true, -- reopen whatever files/panels were open last time
-                                       -- (see "Project layout persistence" below)
-      run_debug_keymaps = { run = "<leader>jr", debug = "<leader>jd", select = "<leader>jc" },
-        -- GLOBAL keymaps for Run/Debug/select-active-config, work from any window/buffer -
-        -- not just while the toolbar's own split is focused (its r/d/c keymaps only fire
-        -- while that specific window is current). Set any field (or the whole table) to false.
-    })
-  end,
 }
 ```
 
-`java-debug-model` does **not** ship its own `ftplugin/java.lua`. Either set
-`opts.auto_attach = true`, or call it yourself:
+Every option is documented in `lua/java-debug-model/init.lua` (`M.opts`). To call `setup()`
+yourself at a later point instead, set `vim.g.java_debug_model_auto_setup = false`.
 
-```lua
--- ftplugin/java.lua
-require("java-debug-model").start_or_attach(vim.api.nvim_get_current_buf())
-```
+Other plugin managers: install this repo plus the dependencies listed in `lazy.lua`;
+`setup()` still runs by itself.
 
 ## Commands
 

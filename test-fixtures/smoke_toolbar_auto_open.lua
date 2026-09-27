@@ -3,7 +3,7 @@ vim.opt.runtimepath:append(vim.fn.getcwd())
 vim.opt.runtimepath:append(vim.fn.expand("~/.local/share/nvim/lazy/nui.nvim"))
 
 local jdm = require("java-debug-model")
-jdm.setup({ toolbar_auto_open = true })
+jdm.setup({ auto_attach = false, toolbar_auto_open = true })
 
 assert(not jdm.toolbar.is_open(), "toolbar must not be open before any .java buffer is seen")
 

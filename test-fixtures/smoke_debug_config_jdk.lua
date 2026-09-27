@@ -1,7 +1,7 @@
 package.path = vim.fn.getcwd() .. "/lua/?.lua;" .. vim.fn.getcwd() .. "/lua/?/init.lua;" .. package.path
 vim.opt.runtimepath:append(vim.fn.getcwd())
 local jdm = require("java-debug-model")
-jdm.setup({ open_j9_java_exec = "/opt/openj9/bin/java" })
+jdm.setup({ auto_attach = false, open_j9_java_exec = "/opt/openj9/bin/java" })
 
 local root = vim.fn.getcwd() .. "/test-fixtures/sample-project"
 local mod_a_path = root .. "/module-a"

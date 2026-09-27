@@ -182,12 +182,10 @@ function M.build_config(root, opts)
   -- Dùng path tuyệt đối, KHÔNG gọi "jdtls" theo PATH - trên PATH là bản Mason mới nhất
   -- (bị lỗi ASM ở trên), còn đây trỏ thẳng launcher của bản 1.54.0 đang dùng.
   local cmd = { jdtls_path .. "/bin/jdtls" }
-  local lombok_jar = jdtls_path .. "/lombok.jar"
-  if vim.fn.filereadable(lombok_jar) == 0 then
-    -- cache jdtls 1.54.0 của nvim-java không kèm lombok.jar trong cùng thư mục, lombok nằm riêng
-    lombok_jar = vim.fn.stdpath("data") .. "/nvim-java/packages/lombok/1.18.42/lombok-1.18.42.jar"
-  end
-  if vim.fn.filereadable(lombok_jar) == 1 then
+  -- lombok.jar: cạnh jdtls, trong gói Mason jdtls, cache nvim-java, bản plugin tự tải, hoặc
+  -- bản mới nhất trong ~/.m2 - xem bootstrap.find_lombok.
+  local lombok_jar = require("java-debug-model.bootstrap").find_lombok(jdtls_path)
+  if lombok_jar then
     -- launcher jdtls.py của Mason dùng argparse, JVM arg PHẢI theo dạng --jvm-arg=-Dxxx (có dấu
     -- =), truyền bare "-javaagent:..." sẽ bị coi là leftover arg và không áp dụng javaagent
     table.insert(cmd, "--jvm-arg=-javaagent:" .. lombok_jar)
@@ -197,7 +195,10 @@ function M.build_config(root, opts)
   -- org.eclipse.jdt.ls.core từ source - xem ~/Git-projects/eclipse.jdt.ls-build, tag v1.54.0):
   -- nếu Mason/nvim-java sau này ghi đè lại bản jdtls gốc chưa vá, agent này vẫn tự vá field
   -- "directories" của MavenProjectImporter lúc runtime. Xem jdtls-patch/src/MavenImporterPatchAgent.java.
-  local jdtls_patch_agent = vim.fn.expand("~/Git-projects/java-debug-model/jdtls-patch/jdtls-maven-importer-patch-agent.jar")
+  -- Tính theo vị trí THẬT của plugin (lazy.nvim cài vào stdpath("data")/lazy/..., không phải
+  -- ~/Git-projects) - trước đây trỏ cứng vào checkout dev nên máy khác không bao giờ có agent này.
+  local plugin_root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h:h")
+  local jdtls_patch_agent = plugin_root .. "/jdtls-patch/jdtls-maven-importer-patch-agent.jar"
   if vim.fn.filereadable(jdtls_patch_agent) == 1 then
     table.insert(cmd, "--jvm-arg=-javaagent:" .. jdtls_patch_agent)
   end
@@ -258,6 +259,36 @@ function M.build_config(root, opts)
   return vim.tbl_deep_extend("force", config, opts.jdtls_config or {})
 end
 
+---Stops every running jdtls and starts it again through THIS launcher (fresh build_config -> picks
+---up bundles/lombok installed since it started - unlike nvim-jdtls's :JdtRestart, which reuses
+---the old config), re-attaching the buffers each one served.
+---@param reason string  shown to the user
+function M.restart_all(reason)
+  local clients = vim.lsp.get_clients({ name = "jdtls" })
+  if #clients == 0 then return end
+  vim.notify("java-debug-model: " .. reason .. " - đang khởi động lại jdtls...", vim.log.levels.INFO)
+  for _, client in ipairs(clients) do
+    local bufs = vim.tbl_keys(client.attached_buffers)
+    local id = client.id
+    client:stop()
+    local waited = 0
+    local timer = vim.uv.new_timer()
+    timer:start(200, 200, vim.schedule_wrap(function()
+      waited = waited + 200
+      if vim.lsp.get_client_by_id(id) and waited < 30000 then return end
+      timer:stop()
+      timer:close()
+      local jdm = require("java-debug-model")
+      for _, buf in ipairs(bufs) do
+        if vim.api.nvim_buf_is_valid(buf) then
+          vim.b[buf].java_debug_model_jdtls_started = nil
+          jdm.start_or_attach(buf)
+        end
+      end
+    end))
+  end
+end
+
 ---Buffer-local keymaps + hooks wired on every jdtls attach.
 ---@param bufnr integer
 ---@param root string
@@ -265,6 +296,25 @@ end
 function M.on_attach(bufnr, root, workspace_dir)
   local jdtls = require("jdtls")
   jdtls.setup_dap({ hotcodereplace = "manual" })
+
+  -- IntelliJ Ctrl+B (declaration)/Ctrl+Alt+B (implementations) + supertypes/subtypes picker.
+  require("java-debug-model.nav").on_attach(bufnr)
+
+  -- Máy chưa có plugin completion (nvim-cmp/blink.cmp/...) -> completion gốc của Neovim, tự bật
+  -- popup khi gõ như IntelliJ (xem completion.lua; opts.native_completion).
+  local jdtls_client = vim.lsp.get_clients({ bufnr = bufnr, name = "jdtls" })[1]
+  if jdtls_client then
+    local ok_opts, jdm_all = pcall(require, "java-debug-model")
+    require("java-debug-model.completion").attach(jdtls_client.id, bufnr,
+      ok_opts and jdm_all.opts.native_completion or "auto")
+  end
+
+  -- JSF: từ member của backing bean (@Named/@ManagedBean/@Component) -> mọi chỗ dùng trong .xhtml.
+  local ok_jdm_opts, jdm_opts = pcall(function() return require("java-debug-model").opts end)
+  if not ok_jdm_opts or jdm_opts.jsf_nav_enabled ~= false then
+    vim.keymap.set("n", "<leader>jgx", function() require("java-debug-model.jsf.nav").find_xhtml_usages() end,
+      { buffer = bufnr, desc = "Java: find .xhtml (JSF EL) usages of this bean member" })
+  end
 
   -- Đẩy Project Model (java-debug-model) vào workspace jdtls ngay khi có thể - resolve nền,
   -- không chặn UI, rồi tự đẩy toàn bộ module (kể cả mồ côi) vào qua sync_workspace_folders().

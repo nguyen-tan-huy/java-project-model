@@ -41,7 +41,14 @@ local DEFAULT_JDTLS_PREBUILT_URL =
   "https://github.com/nguyen-tan-huy/eclipse.jdt.ls/releases/download/1.54.0/jdt-language-server-1.54.0-202609010342.tar.gz"
 
 M.opts = {
-  auto_attach = false,
+  -- Start/attach jdtls on its own: immediately when Neovim opens inside a Maven project (cwd has a
+  -- pom.xml), otherwise on the first .java buffer - "cài xong mở lên là chạy" like IntelliJ. Set
+  -- to false to call require("java-debug-model").start_or_attach(bufnr) yourself instead.
+  auto_attach = true,
+  -- Code completion when NO completion plugin is installed: Neovim's own vim.lsp.completion for
+  -- jdtls + the JSF EL server, popup while typing, <C-Space>/<CR> like IntelliJ (completion.lua).
+  -- "auto" = only without nvim-cmp/blink.cmp/mini.completion/coq; true = always; false = never.
+  native_completion = "auto",
   -- Whether ui/bufferline.lua's IntelliJ-style open-buffer tab row is turned on. It attaches via
   -- Neovim's per-window 'winbar' option to just the real editor window(s) - scoped to the editor
   -- panel's own width, stopping at the Project Tree/Maven Panel sidebars, matching IntelliJ's own
@@ -74,6 +81,19 @@ M.opts = {
   -- activates for currently-open java buffers with jdtls attached - set to false to skip
   -- registering its autocmds/mouse mapping entirely.
   main_gutter_enabled = true,
+  -- IntelliJ Ctrl+B for JSF Facelets views (jsf/nav.lua): on a `.xhtml` buffer, `<C-b>` jumps
+  -- from an EL expression (#{bean.prop}, #{bean.action()}) to the backing bean's Java member, and
+  -- from <ui:include src>/<ui:composition template>/<ui:decorate template>/<c:import url> or a
+  -- composite-component tag to the referenced .xhtml file. The reverse direction (Java bean
+  -- member -> every .xhtml usage) is `<leader>jgx` on a Java buffer / `:JavaXhtmlUsages`.
+  -- Only ever hooks buffers whose file name ends in .xhtml - set to false to skip entirely.
+  jsf_nav_enabled = true,
+  -- EL auto-completion (+ hover `K`, definition `gd`) on .xhtml buffers, served by an in-process
+  -- LSP server named "jsf-el" (jsf/server.lua) - so nvim-cmp's `nvim_lsp` source / blink.cmp /
+  -- native LSP completion pick it up with no extra config: `#{` -> beans + page variables,
+  -- `#{a.b.` -> properties/methods of b's type (jdtls-inferred), include src="/..." -> .xhtml
+  -- paths, `<cc:` -> composite component tags. Only active while jsf_nav_enabled is on.
+  jsf_completion_enabled = true,
   -- "thêm tính năng lưu trạng thái của project khi đang mở... khi vào lại load lại không phải mở
   -- lại từ đầu" (save what was open so re-entering the project restores it instead of starting
   -- from scratch) - restores whichever files were open and whichever of this plugin's own panels
@@ -93,6 +113,8 @@ M.opts = {
   -- only way to trigger them; mouse-click support itself came back for the Config/module dropdowns
   -- (ui/toolbar.lua's own `<LeftRelease>` handler) and, separately, for the tab row's own switch/
   -- close clicks (ui/bufferline.lua's own winbar click shims).
+  -- Each value is one key or a LIST of keys, e.g. run = { "<S-F10>", "<F22>" } - terminals differ
+  -- in how they send Shift/Ctrl+F-keys (xterm-style ones report Shift+F10 as <F22>).
   -- `<leader>j*` matches jdtls_launcher.lua's own convention (<leader>jv/jR/joi/...); set any field
   -- to false to disable just that one, or the whole table to false to disable all four and rely on
   -- :JavaToolbarRun/:JavaToolbarDebug/:JavaConfigSelect (or the toolbar's own r/d/c/m, plus mouse
@@ -103,6 +125,13 @@ M.opts = {
     debug = "<leader>jd",
     select = "<leader>jc",
     select_module = "<leader>jm",
+    -- Restart the ACTIVE config's running session (IntelliJ's Rerun, Ctrl+F5): stop its JVM,
+    -- wait for the port to free up, relaunch in the same Run/Debug mode with a freshly resolved
+    -- classpath. Not running yet -> just launches it.
+    -- (<leader>jS, not <leader>js: that is a common prefix for session keymaps, e.g. <leader>jsm)
+    restart = "<leader>jS",
+    -- Same, but always relaunches as a DEBUG session (switches a Run-mode session to Debug).
+    restart_debug = "<leader>jD",
   },
   active_profiles = {},
   open_j9_java_exec = nil,
@@ -598,7 +627,8 @@ function M.toolbar_toggle(root)
   toolbar.toggle(root)
 end
 
-function M.debug_config_run(root, name)
+---@param opts { no_debug: boolean? }?  no_debug = launch as "Run" (noDebug) instead of "Debug"
+function M.debug_config_run(root, name, opts)
   local cfg = config_store.get(root, name)
   if not cfg then
     vim.notify("java-debug-model: no debug config named '" .. name .. "'", vim.log.levels.ERROR)
@@ -610,7 +640,10 @@ function M.debug_config_run(root, name)
   -- instead, defeating the point of the per-config field entirely.
   M.get_project(root, function(project)
     if not project then return end
-    dap.launch(project, cfg, { open_j9_java_exec = M.opts.open_j9_java_exec })
+    dap.launch(project, cfg, {
+      open_j9_java_exec = M.opts.open_j9_java_exec,
+      no_debug = opts and opts.no_debug or false,
+    })
   end, cfg.maven_profiles)
 end
 
@@ -633,6 +666,14 @@ function M.debug_config_edit(root, name)
 end
 
 function M.setup(opts)
+  -- plugin/java-debug-model.lua calls setup({}) by itself when the user never did (zero-config
+  -- install) - and a user may call it more than once. Everything below registers autocmds/keymaps,
+  -- so only the FIRST call does that; later calls just merge their options in.
+  if M._setup_called then
+    M.opts = vim.tbl_deep_extend("force", M.opts, opts or {})
+    return
+  end
+  M._setup_called = true
   M.opts = vim.tbl_deep_extend("force", M.opts, opts or {})
   session.setup_listeners()
 
@@ -651,6 +692,10 @@ function M.setup(opts)
 
   if M.opts.main_gutter_enabled then
     main_gutter.setup()
+  end
+
+  if M.opts.jsf_nav_enabled then
+    require("java-debug-model.jsf.nav").setup()
   end
 
   -- Turns the IntelliJ-style tab row on/off for the whole session - it's independent of
@@ -687,7 +732,10 @@ function M.setup(opts)
       dest = M.opts.jdtls_prebuilt_dest,
     })
   end
-  bootstrap.ensure_mason_packages()
+  bootstrap.ensure_mason_packages(function()
+    jdtls_launcher.restart_all("đã cài xong java-debug-adapter/java-test (Debug + Run Test)")
+  end)
+  bootstrap.ensure_lombok()
   if M.opts.spring_boot_ls_path ~= false then
     bootstrap.setup_spring_boot({ ls_path = M.opts.spring_boot_ls_path })
   end
@@ -756,22 +804,58 @@ function M.setup(opts)
     })
   end
 
+  -- One-time check the first time a Maven project is seen: without a JDK 21+ (jdtls itself needs
+  -- it) or Maven nothing below works, and jdtls would otherwise just die silently - say so once,
+  -- with the fix, instead. Full report: :checkhealth java-debug-model.
+  local essentials_checked = false
+  local function check_essentials(root)
+    if essentials_checked or not root or vim.fn.filereadable(root .. "/pom.xml") == 0 then return end
+    essentials_checked = true
+    vim.defer_fn(function()
+      local problems = require("java-debug-model.health").missing_essentials(root)
+      if #problems > 0 then
+        vim.notify("java-debug-model:\n  - " .. table.concat(problems, "\n  - ")
+          .. "\nXem chi tiết: :checkhealth java-debug-model", vim.log.levels.ERROR)
+      end
+    end, 200)
+  end
+  check_essentials(last_root)
+  vim.api.nvim_create_autocmd("FileType", {
+    pattern = "java",
+    callback = function(args) check_essentials(find_root(args.buf)) end,
+  })
+
+  ---One key or a list of keys -> the same action.
+  local function map_keys(lhs, rhs, opts)
+    for _, key in ipairs(type(lhs) == "table" and lhs or { lhs }) do
+      vim.keymap.set("n", key, rhs, opts)
+    end
+  end
+
   if M.opts.run_debug_keymaps then
     local keys = M.opts.run_debug_keymaps
     if keys.run then
-      vim.keymap.set("n", keys.run, function() toolbar.run_active(find_root(0), true) end,
+      map_keys(keys.run, function() toolbar.run_active(find_root(0), true) end,
         { desc = "Java: run active config" })
     end
     if keys.debug then
-      vim.keymap.set("n", keys.debug, function() toolbar.run_active(find_root(0), false) end,
+      map_keys(keys.debug, function() toolbar.run_active(find_root(0), false) end,
         { desc = "Java: debug active config" })
     end
+    if keys.restart then
+      map_keys(keys.restart, function() toolbar.restart_active(find_root(0)) end,
+        { desc = "Java: restart active config's running session" })
+    end
+    if keys.restart_debug then
+      map_keys(keys.restart_debug, function() toolbar.restart_active(find_root(0), { no_debug = false }) end,
+        { desc = "Java: restart active config as a debug session" })
+    end
     if keys.select then
-      vim.keymap.set("n", keys.select, function() toolbar.select_config(find_root(0)) end,
+      map_keys(keys.select, function() toolbar.select_config(find_root(0)) end,
         { desc = "Java: select active Run/Debug Configuration" })
     end
     if keys.select_module then
-      vim.keymap.set("n", keys.select_module, function() toolbar.select_module(find_root(0)) end,
+      map_keys(keys.select_module, function() toolbar.select_module(find_root(0)) end,
         { desc = "Java: open module selector" })
     end
   end
@@ -806,6 +890,9 @@ M.bufferline = bufferline
 M.statusline_ui = statusline
 M.main_gutter = main_gutter
 M.layout_state = layout_state
+M.nav = require("java-debug-model.nav")
+M.jsf_nav = require("java-debug-model.jsf.nav")
+M.jsf_bean_index = require("java-debug-model.jsf.bean_index")
 
 ---Short "⏳ ..." string while a Maven resolve, a Maven Lifecycle run, or a
 ---debug launch is in flight, empty otherwise - wire into a statusline

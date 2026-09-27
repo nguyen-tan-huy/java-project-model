@@ -14,6 +14,7 @@ local M = {}
 ---@field root string           -- project root this session's DebugConfig lives under (config_store key) - needed by M.restart to re-run debug_config_run(root, name)
 ---@field module_path string
 ---@field profiles string[]
+---@field no_debug boolean     -- launched as "Run" (noDebug) rather than "Debug" - M.restart relaunches the same way
 ---@field status "starting"|"running"|"stopped"
 ---@field dap_session table|nil   -- the nvim-dap Session object, once started
 
@@ -131,7 +132,7 @@ local function wait_release_then(entry, cb, max_wait)
   vim.defer_fn(check, interval)
 end
 
----@param fields table { name, root, module_path, profiles }
+---@param fields table { name, root, module_path, profiles, no_debug? }
 ---@return integer id
 function M.register(fields)
   local id = next_id
@@ -143,6 +144,7 @@ function M.register(fields)
     root = fields.root,
     module_path = fields.module_path,
     profiles = fields.profiles or {},
+    no_debug = fields.no_debug or false,
     status = "starting",
     dap_session = nil,
   })
@@ -251,8 +253,11 @@ end
 ---No-op (just notifies) if config_store no longer has a config named `entry.name` (removed since
 ---this session was launched) - required lazily to avoid a require cycle with init.lua, which
 ---itself requires this module.
+---Relaunches in the SAME mode (Run/noDebug vs Debug) the session was started in, unless
+---`opts.no_debug` says otherwise (e.g. pressing Debug on a config currently running in Run mode).
 ---@param id integer
-function M.restart(id)
+---@param opts { no_debug: boolean? }?
+function M.restart(id, opts)
   local entry
   for _, e in ipairs(sessions) do
     if e.id == id then
@@ -286,7 +291,9 @@ function M.restart(id)
       if e.id ~= id then table.insert(kept, e) end
     end
     sessions = kept
-    require("java-debug-model").debug_config_run(entry.root, entry.name)
+    local no_debug = entry.no_debug
+    if opts and opts.no_debug ~= nil then no_debug = opts.no_debug end
+    require("java-debug-model").debug_config_run(entry.root, entry.name, { no_debug = no_debug })
   end)
 end
 

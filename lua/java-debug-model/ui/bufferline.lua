@@ -61,12 +61,79 @@ function M.jdt_class_label(path)
   return class_name .. " [" .. lib_label .. "]"
 end
 
+---Reads one resolved color attribute ("fg"/"bg") from a highlight group, following links.
+---@return integer|nil
+local function hl_color(name, attr)
+  local ok, h = pcall(vim.api.nvim_get_hl, 0, { name = name, link = false })
+  if not ok or not h then return nil end
+  return h[attr]
+end
+
+---Blends two 24-bit colors - `t` = 0 gives `a`, 1 gives `b`. Used to derive the tab strip's
+---background shades from the colorscheme's own Normal bg instead of hard-coding a palette.
+local function blend(a, b, t)
+  if not a then return b end
+  if not b then return a end
+  local function ch(c, shift) return math.floor(c / 2 ^ shift) % 256 end
+  local out = 0
+  for _, shift in ipairs({ 16, 8, 0 }) do
+    local v = math.floor(ch(a, shift) * (1 - t) + ch(b, shift) * t + 0.5)
+    out = out + v * 2 ^ shift
+  end
+  return out
+end
+
+-- Resolved backgrounds, reused by icon_hl() to give devicon glyphs the same bg as their tab.
+local colors = {}
+
+---bufferline.nvim-style palette derived from the active colorscheme: the active tab shares the
+---editor's own Normal bg (so it visually "opens into" the buffer below), inactive tabs and the
+---empty fill sit on progressively darker shades, and a thin accent bar marks the selected tab.
+---Re-run on ColorScheme so switching themes doesn't leave stale colors behind.
 function M.setup_highlights()
   local hl = vim.api.nvim_set_hl
-  hl(0, "JavaTabbarActive", { link = "TabLineSel", default = true })
-  hl(0, "JavaTabbarInactive", { link = "TabLine", default = true })
-  hl(0, "JavaTabbarSep", { link = "TabLineFill", default = true })
-  hl(0, "JavaTabbarClose", { link = "Comment", default = true })
+  local normal_bg = hl_color("Normal", "bg") or 0x1e1e2e
+  local normal_fg = hl_color("Normal", "fg") or 0xcdd6f4
+  local dim_fg = hl_color("Comment", "fg") or blend(normal_fg, normal_bg, 0.5)
+  local accent = hl_color("Function", "fg") or hl_color("Directory", "fg") or normal_fg
+  local modified = hl_color("DiagnosticWarn", "fg") or hl_color("WarningMsg", "fg") or accent
+  local fill_bg = blend(normal_bg, 0x000000, 0.35)
+  local inactive_bg = blend(normal_bg, 0x000000, 0.18)
+  colors = { active = normal_bg, inactive = inactive_bg }
+
+  hl(0, "JavaTabbarFill", { bg = fill_bg })
+  hl(0, "JavaTabbarActive", { fg = normal_fg, bg = normal_bg, bold = true })
+  hl(0, "JavaTabbarInactive", { fg = dim_fg, bg = inactive_bg })
+  hl(0, "JavaTabbarIndicator", { fg = accent, bg = normal_bg })
+  hl(0, "JavaTabbarIndicatorInactive", { fg = inactive_bg, bg = inactive_bg })
+  hl(0, "JavaTabbarModifiedActive", { fg = modified, bg = normal_bg })
+  hl(0, "JavaTabbarModifiedInactive", { fg = modified, bg = inactive_bg })
+  hl(0, "JavaTabbarCloseActive", { fg = normal_fg, bg = normal_bg })
+  hl(0, "JavaTabbarCloseInactive", { fg = dim_fg, bg = inactive_bg })
+  hl(0, "JavaTabbarLib", { fg = dim_fg, bg = normal_bg, italic = true })
+  hl(0, "JavaTabbarLibInactive", { fg = dim_fg, bg = inactive_bg, italic = true })
+  hl(0, "JavaTabbarSep", { fg = fill_bg, bg = fill_bg })
+end
+
+local icon_hl_cache = {}
+
+---Devicon highlight groups carry their own bg (usually none), which would punch a hole in the
+---tab's background - derive a per-(icon, state) group with the icon's fg on the tab's own bg.
+---@param base string|nil  devicons highlight group
+---@param active boolean
+---@return string
+local function icon_hl(base, active)
+  local fallback = active and "JavaTabbarActive" or "JavaTabbarInactive"
+  if not base then return fallback end
+  local name = "JavaTabbarIcon" .. base:gsub("[^%w]", "") .. (active and "Active" or "Inactive")
+  if not icon_hl_cache[name] then
+    vim.api.nvim_set_hl(0, name, {
+      fg = hl_color(base, "fg"),
+      bg = active and colors.active or colors.inactive,
+    })
+    icon_hl_cache[name] = true
+  end
+  return name
 end
 
 ---nvim-web-devicons is OPTIONAL (same stance as nui.nvim in ui/toolbar.lua) - a missing/absent
@@ -78,6 +145,7 @@ local function get_icon(name)
   if not ok then return nil, nil end
   local ext = name:match("%.([%w_]+)$")
   local basename = vim.fn.fnamemodify(name, ":t")
+  if name:match("^jdt://") then ext, basename = "java", "x.java" end
   local icon, hl_group = devicons.get_icon(basename, ext, { default = true })
   return icon, hl_group
 end
@@ -94,6 +162,8 @@ end
 ---off THAT window's own displayed buffer (`nvim_win_get_buf(winid)`), not whatever the globally
 ---current window happens to be, so two editor splits each correctly highlight their OWN open file
 ---(matching IntelliJ, where each split's own tab strip highlights its own selected tab).
+---Each tab renders as `▎ <icon> Name [lib]  ●/󰅖 ` - an accent bar on the selected tab, a dot for
+---unsaved changes in place of the close button (bufferline.nvim's convention).
 ---@param winid integer
 ---@return string
 function M.winbar_string(winid)
@@ -103,27 +173,41 @@ function M.winbar_string(winid)
   local any = false
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(bufnr) and vim.bo[bufnr].buflisted and vim.bo[bufnr].buftype == "" then
-      if any then table.insert(out, "%#JavaTabbarSep# ") end
       any = true
+      local active = bufnr == current
+      local sfx = active and "Active" or "Inactive"
       local name = vim.api.nvim_buf_get_name(bufnr)
       local label = M.jdt_class_label(name) or (name ~= "" and vim.fn.fnamemodify(name, ":t") or "[No Name]")
-      local modified = vim.bo[bufnr].modified and " [+]" or ""
-      local hl_group = (bufnr == current) and "JavaTabbarActive" or "JavaTabbarInactive"
-      local icon, icon_hl = get_icon(name)
+      local lib
+      label, lib = label:match("^(.-) (%[.+%])$") or label, label:match(" (%[.+%])$")
+      local tab_hl = "JavaTabbar" .. sfx
+      local icon, base_icon_hl = get_icon(name)
 
-      table.insert(out, string.format("%%#%s#%%%d@JavaDebugModelTabSwitchClick@ ", hl_group, bufnr))
+      table.insert(out, string.format("%%%d@JavaDebugModelTabSwitchClick@", bufnr))
+      table.insert(out, string.format("%%#JavaTabbarIndicator%s#▎",
+        active and "" or "Inactive"))
+      table.insert(out, string.format("%%#%s# ", tab_hl))
       if icon then
-        table.insert(out, string.format("%%#%s#%s %%#%s#", icon_hl or hl_group, esc(icon), hl_group))
+        table.insert(out, string.format("%%#%s#%s %%#%s#", icon_hl(base_icon_hl, active), esc(icon), tab_hl))
       end
-      table.insert(out, esc(label .. modified))
+      table.insert(out, esc(label))
+      if lib then
+        table.insert(out, string.format(" %%#JavaTabbarLib%s#%s%%#%s#", active and "" or "Inactive", esc(lib), tab_hl))
+      end
       table.insert(out, "  %X")
-      table.insert(out, string.format("%%#JavaTabbarClose#%%%d@JavaDebugModelTabCloseClick@x%%X", bufnr))
-      table.insert(out, string.format("%%#%s#  ", hl_group))
+      if vim.bo[bufnr].modified then
+        table.insert(out, string.format("%%#JavaTabbarModified%s#●", sfx))
+      else
+        table.insert(out, string.format("%%#JavaTabbarClose%s#%%%d@JavaDebugModelTabCloseClick@󰅖%%X", sfx, bufnr))
+      end
+      table.insert(out, string.format("%%#%s#  ", tab_hl))
+      table.insert(out, "%#JavaTabbarSep#▕")
     end
   end
   if not any then
-    table.insert(out, "%#JavaTabbarSep# (no open buffers) ")
+    table.insert(out, "%#JavaTabbarInactive# (no open buffers) ")
   end
+  table.insert(out, "%#JavaTabbarFill#")
   return table.concat(out)
 end
 
@@ -150,7 +234,24 @@ function M.on_close_click(minwid)
       vim.log.levels.WARN)
     return
   end
+  -- Move every window still showing this buffer onto another listed buffer first - a plain
+  -- buffer delete would otherwise close the editor window itself (or leave a stale tab behind).
+  local alt
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if b ~= bufnr and vim.api.nvim_buf_is_loaded(b) and vim.bo[b].buflisted and vim.bo[b].buftype == "" then
+      alt = b
+      if b > bufnr then break end
+    end
+  end
+  for _, winid in ipairs(vim.fn.win_findbuf(bufnr)) do
+    if alt then
+      vim.api.nvim_win_set_buf(winid, alt)
+    else
+      vim.api.nvim_win_call(winid, function() vim.cmd("enew") end)
+    end
+  end
   pcall(vim.api.nvim_buf_delete, bufnr, { force = false })
+  M.refresh()
 end
 
 ---True for a window this row should actually attach to: a real (non-floating) window that isn't
@@ -213,8 +314,18 @@ function M.enable()
     { "BufEnter", "BufAdd", "BufDelete", "BufWipeout", "BufModifiedSet", "WinEnter", "WinNew", "VimResized" },
     {
       group = vim.api.nvim_create_augroup(AUGROUP, { clear = true }),
-      callback = M.refresh,
+      -- BufDelete/BufWipeout fire while the buffer is still listed, so a synchronous refresh
+      -- would still draw the tab being closed - defer until the deletion has finished.
+      callback = function() vim.schedule(M.refresh) end,
     })
+  vim.api.nvim_create_autocmd("ColorScheme", {
+    group = AUGROUP,
+    callback = function()
+      icon_hl_cache = {}
+      M.setup_highlights()
+      M.refresh()
+    end,
+  })
   M.refresh()
 end
 

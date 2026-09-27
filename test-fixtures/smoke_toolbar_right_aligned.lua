@@ -8,7 +8,7 @@ vim.opt.runtimepath:append(vim.fn.getcwd())
 vim.opt.runtimepath:append(vim.fn.expand("~/.local/share/nvim/lazy/nui.nvim"))
 
 local jdm = require("java-debug-model")
-jdm.setup({ bufferline_enabled = false }) -- isolate from the tabline occupying row 0, this test cares about the toolbar's OWN window position
+jdm.setup({ auto_attach = false, bufferline_enabled = false }) -- isolate from the tabline occupying row 0, this test cares about the toolbar's OWN window position
 local root = vim.fn.getcwd() .. "/test-fixtures/sample-project"
 jdm.config_store.add(root, {
   name = "App", module_path = root .. "/module-a", main_class = "com.example.modulea.App",

@@ -12,7 +12,7 @@ local jdm = require("java-debug-model")
 -- "Config: <name>" text would otherwise duplicate the tabline's own identical text), which is
 -- exactly what this test is trying to verify the OPPOSITE of (that a saved-open toolbar comes
 -- back) - isolate from that here the same way smoke_toolbar_layout.lua etc. already do.
-jdm.setup({ restore_layout_on_start = false, toolbar_auto_open = false, bufferline_enabled = false })
+jdm.setup({ auto_attach = false, restore_layout_on_start = false, toolbar_auto_open = false, bufferline_enabled = false })
 
 local root = vim.fn.getcwd() .. "/test-fixtures/sample-project"
 local app_file = root .. "/module-a/src/main/java/com/example/modulea/App.java"

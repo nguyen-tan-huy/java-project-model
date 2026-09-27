@@ -3,7 +3,7 @@ vim.opt.runtimepath:append(vim.fn.getcwd())
 vim.opt.runtimepath:append(vim.fn.expand("~/.local/share/nvim/lazy/nui.nvim"))
 
 local jdm = require("java-debug-model")
-jdm.setup({})
+jdm.setup({ auto_attach = false })
 local root = vim.fn.getcwd() .. "/test-fixtures/sample-project"
 vim.cmd("edit " .. root .. "/module-a/src/main/java/com/example/modulea/App.java")
 

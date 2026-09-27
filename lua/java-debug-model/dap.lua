@@ -120,6 +120,7 @@ function M.launch(project, config, opts)
     root = project.root,
     module_path = config.module_path,
     profiles = config.maven_profiles,
+    no_debug = opts.no_debug,
   })
 
   -- Tự gắn 1 marker DUY NHẤT (theo session_id) vào chính vmArgs của debuggee - session.lua's

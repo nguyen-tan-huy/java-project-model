@@ -14,7 +14,7 @@ vim.opt.runtimepath:append(vim.fn.getcwd())
 vim.opt.runtimepath:append(vim.fn.expand("~/.local/share/nvim/lazy/nui.nvim"))
 
 local jdm = require("java-debug-model")
-jdm.setup({})
+jdm.setup({ auto_attach = false })
 local root = vim.fn.getcwd() .. "/test-fixtures/sample-project"
 -- A real buffer under `root` so session_manager_ui.open()'s own `jdm._find_root(0)` resolves the
 -- SAME root the configs/session below are registered against (it has no explicit root

@@ -165,6 +165,14 @@ function M.run_active(root, no_debug)
       vim.log.levels.WARN)
     return
   end
+  -- Already running -> restart it (in the mode just asked for) instead of launching a SECOND JVM
+  -- for the same config next to it - that one would just die on "port already in use" for any
+  -- app with a fixed server/debug port. Same as IntelliJ's single-instance "Stop and Rerun".
+  local live = M.live_session(root, cfg.name)
+  if live then
+    require("java-debug-model.session").restart(live.id, { no_debug = no_debug })
+    return
+  end
   -- Lazy require - init.lua requires this module at its own top level, so a top-level require
   -- here back into "java-debug-model" would be a load-order cycle; by the time this function
   -- actually RUNS (a user pressed a key / ran a command), setup() has long since finished and the
@@ -192,6 +200,51 @@ function M.run_active(root, no_debug)
     local ok_session_ui, session_manager_ui = pcall(require, "java-debug-model.ui.session_manager")
     if ok_session_ui then session_manager_ui.focus_entry(session_id) end
   end, cfg.maven_profiles)
+end
+
+---Newest tracked session of saved config `name` under `root` that hasn't stopped yet
+---(starting or running), or nil.
+---@param root string
+---@param name string
+---@return table|nil session.SessionEntry
+function M.live_session(root, name)
+  local found
+  for _, e in ipairs(require("java-debug-model.session").list()) do
+    if e.kind ~= "test" and e.root == root and e.name == name and e.status ~= "stopped" then found = e end
+  end
+  return found
+end
+
+---Restarts the ACTIVE config's running session (IntelliJ Rerun) - stop, wait for its port to be
+---released, relaunch in the SAME Run/Debug mode it was started in, with a freshly resolved
+---classpath (session.restart). Not running -> launches it, in the mode its last (stopped) run
+---used, or Debug if it never ran this Neovim session. `opts.no_debug` forces the mode instead:
+---false = restart the active profile's session as a DEBUG session (<leader>jD /
+---:JavaToolbarRestartDebug), even if it's currently running in Run mode.
+---@param root string
+---@param opts { no_debug: boolean? }?
+function M.restart_active(root, opts)
+  opts = opts or {}
+  local cfg = active_config.resolve(root, config_store)
+  if not cfg then
+    vim.notify("java-debug-model: chưa có Run/Debug Configuration nào - dùng :JavaDebugConfigAdd trước.",
+      vim.log.levels.WARN)
+    return
+  end
+  local session = require("java-debug-model.session")
+  local live = M.live_session(root, cfg.name)
+  if live then
+    session.restart(live.id, { no_debug = opts.no_debug })
+    return
+  end
+  local last
+  for _, e in ipairs(session.list()) do
+    if e.kind ~= "test" and e.root == root and e.name == cfg.name then last = e end
+  end
+  vim.notify("java-debug-model: '" .. cfg.name .. "' chưa chạy - khởi chạy mới.", vim.log.levels.INFO)
+  local no_debug = opts.no_debug
+  if no_debug == nil then no_debug = last and last.no_debug or false end
+  M.run_active(root, no_debug)
 end
 
 ---Selecting/updating a profile from ONE dropdown - matches IntelliJ's own configuration selector,

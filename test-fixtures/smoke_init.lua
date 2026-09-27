@@ -2,7 +2,7 @@ package.path = vim.fn.getcwd() .. "/lua/?.lua;" .. vim.fn.getcwd() .. "/lua/?/in
 vim.opt.runtimepath:append(vim.fn.getcwd())
 
 local jdm = require("java-debug-model")
-jdm.setup({})
+jdm.setup({ auto_attach = false })
 
 -- source plugin/java-debug-model.lua to confirm all commands register cleanly
 vim.cmd("source " .. vim.fn.getcwd() .. "/plugin/java-debug-model.lua")

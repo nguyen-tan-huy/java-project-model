@@ -18,7 +18,7 @@ local workspace = vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
 
 local jdm = require("java-debug-model")
-jdm.setup({})
+jdm.setup({ auto_attach = false, restore_layout_on_start = false }) -- hermetic: a saved layout-state.json would switch the current buffer
 
 local app_file = root .. "/module-a/src/main/java/com/example/modulea/App.java"
 vim.cmd("edit " .. app_file)

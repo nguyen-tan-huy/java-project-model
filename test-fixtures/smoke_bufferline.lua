@@ -6,7 +6,7 @@ vim.opt.runtimepath:append(vim.fn.getcwd())
 vim.opt.runtimepath:append(vim.fn.expand("~/.local/share/nvim/lazy/nui.nvim"))
 
 local jdm = require("java-debug-model")
-jdm.setup({ toolbar_auto_open = false }) -- bufferline_enabled default true; drive toolbar.open() by hand
+jdm.setup({ auto_attach = false, toolbar_auto_open = false }) -- bufferline_enabled default true; drive toolbar.open() by hand
 local root = vim.fn.getcwd() .. "/test-fixtures/sample-project"
 
 local app_file = root .. "/module-a/src/main/java/com/example/modulea/App.java"

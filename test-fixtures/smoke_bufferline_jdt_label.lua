@@ -9,7 +9,7 @@ vim.opt.runtimepath:append(vim.fn.getcwd())
 vim.opt.runtimepath:append(vim.fn.expand("~/.local/share/nvim/lazy/nui.nvim"))
 
 local jdm = require("java-debug-model")
-jdm.setup({ toolbar_auto_open = false })
+jdm.setup({ auto_attach = false, toolbar_auto_open = false })
 local root = vim.fn.getcwd() .. "/test-fixtures/sample-project"
 jdm.toolbar.open(root)
 

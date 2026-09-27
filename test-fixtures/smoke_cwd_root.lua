@@ -6,7 +6,7 @@ local root = vim.fn.getcwd() .. "/test-fixtures/sample-project"
 vim.cmd("cd " .. vim.fn.fnameescape(root))
 
 local jdm = require("java-debug-model")
-jdm.setup({})
+jdm.setup({ auto_attach = false })
 
 -- current buffer is still the default empty/unnamed buffer - no .java file
 -- was ever opened. find_root must already know the project from cwd alone.

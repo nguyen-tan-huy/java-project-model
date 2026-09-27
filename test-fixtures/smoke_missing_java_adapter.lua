@@ -12,7 +12,7 @@ vim.opt.runtimepath:append(vim.fn.getcwd())
 vim.opt.runtimepath:append(vim.fn.expand("~/.local/share/nvim/lazy/nvim-dap"))
 
 local jdm = require("java-debug-model")
-jdm.setup({})
+jdm.setup({ auto_attach = false })
 local root = vim.fn.getcwd() .. "/test-fixtures/sample-project"
 local cfg = {
   name = "App", module_path = root .. "/module-a", main_class = "com.example.modulea.App",
