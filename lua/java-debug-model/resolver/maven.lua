@@ -492,8 +492,7 @@ function M.build(root, opts, callback)
 
     if opts.on_progress then opts.on_progress("java-debug-model: resolving Maven project (mvn)...") end
 
-    M._run_maven(root, { "help:effective-pom" }, { profiles = opts.active_profiles, offline = opts.offline },
-      function(ok, stdout, stderr)
+    local function on_root_pom(ok, stdout, stderr)
         if not ok then
           callback(false, nil, "mvn help:effective-pom failed: " .. stderr)
           return
@@ -582,7 +581,17 @@ function M.build(root, opts, callback)
               done()
             end)
         end, finalize)
-      end)
+    end
+
+    -- Root without its own pom.xml (e.g. a folder holding only independent modules like
+    -- axigen-service/{axigen-api,axigen-core}): `mvn` at root would just fail with "no POM in
+    -- this directory", so skip it - every scanned pom then resolves on the independent path.
+    if vim.fn.filereadable(root .. "/pom.xml") == 0 then
+      on_root_pom(true, "", "")
+      return
+    end
+    M._run_maven(root, { "help:effective-pom" }, { profiles = opts.active_profiles, offline = opts.offline },
+      on_root_pom)
   end)
 end
 
